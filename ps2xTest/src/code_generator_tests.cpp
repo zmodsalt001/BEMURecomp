@@ -180,6 +180,20 @@ void register_code_generator_tests()
                  "the registration source must use the same unambiguous stub header");
     });
 
+    tc.Run("unsigned integer loads use explicit zero extension", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+        const std::string lbu = gen.translateInstruction(makeIType(0x8F10, OPCODE_LBU, 1, 2, 0x10));
+        const std::string lhu = gen.translateInstruction(makeIType(0x8F14, OPCODE_LHU, 1, 3, 0x12));
+        const std::string lwu = gen.translateInstruction(makeIType(0x8F18, OPCODE_LWU, 1, 4, 0x14));
+
+        t.IsTrue(lbu.find("SET_GPR_ZE32(ctx, 2") != std::string::npos,
+                 "LBU must zero-extend into the low 64-bit scalar lane");
+        t.IsTrue(lhu.find("SET_GPR_ZE32(ctx, 3") != std::string::npos,
+                 "LHU must zero-extend into the low 64-bit scalar lane");
+        t.IsTrue(lwu.find("SET_GPR_ZE32(ctx, 4") != std::string::npos,
+                 "LWU must not sign-extend bit 31 into the allocator bitmap value");
+    });
+
     tc.Run("SYSCALL publishes its continuation before entering the runtime", [](TestCase &t) {
         Function func;
         func.name = "syscall_resume";
@@ -304,6 +318,21 @@ void register_code_generator_tests()
                  "constant MMIO SW should emit a direct runtime Store32");
         t.IsTrue(generated.find("WRITE32(ADD32(GPR_U32(ctx, 1)") == std::string::npos,
                  "constant MMIO SW should not go through WRITE32 address classification");
+    });
+
+    tc.Run("stale MMIO annotation does not replace the guest effective address", [](TestCase &t) {
+        Instruction store = makeSw(0x1100, 2, 1, 0);
+        store.isMmio = true;
+        store.mmioAddress = 0x10000000u; // A stale analyzer hint; $at still owns the real address.
+
+        CodeGenerator gen({}, {});
+        const std::string generated = gen.translateInstruction(store);
+        printGeneratedCode("stale MMIO annotation does not replace the guest effective address", generated);
+
+        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, ADD32(GPR_U32(ctx, 1), 0), GPR_U32(ctx, 2))") != std::string::npos,
+                 "MMIO annotations should select runtime access without hard-coding a possibly stale address");
+        t.IsTrue(generated.find("0x10000000u") == std::string::npos,
+                 "stale MMIO address should not replace the address calculated by guest registers");
     });
 
     tc.Run("constant RDRAM load and store emit fast memory access", [](TestCase &t) {

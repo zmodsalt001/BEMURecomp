@@ -1,5 +1,6 @@
 #include "MiniTest.h"
 #include "ps2x/iop/iop_subsystem.h"
+#include "ps2x/iop/ps2_path.h"
 
 #include <algorithm>
 #include <array>
@@ -39,7 +40,7 @@ namespace
     {
     public:
         explicit FakeIopHost(size_t memorySize = 0x10000u)
-            : memory(memorySize, 0u)
+            : memory(memorySize, 0u), iopMemory(0x00200000u, 0u)
         {
         }
 
@@ -83,6 +84,52 @@ namespace
         {
             normalized = address & 0x1FFFFFFFu;
             return normalized < memory.size();
+        }
+
+        bool readIopMemory(uint32_t address, void *destination, size_t size) const override
+        {
+            uint32_t normalized = 0u;
+            if ((!destination && size != 0u) || !normalizeIopAddress(address, normalized) ||
+                static_cast<uint64_t>(normalized) + size > iopMemory.size())
+                return false;
+            if (size != 0u)
+                std::memcpy(destination, iopMemory.data() + normalized, size);
+            return true;
+        }
+
+        bool writeIopMemory(uint32_t address, const void *source, size_t size) override
+        {
+            uint32_t normalized = 0u;
+            if ((!source && size != 0u) || !normalizeIopAddress(address, normalized) ||
+                static_cast<uint64_t>(normalized) + size > iopMemory.size())
+                return false;
+            if (size != 0u)
+                std::memcpy(iopMemory.data() + normalized, source, size);
+            return true;
+        }
+
+        bool zeroIopMemory(uint32_t address, size_t size) override
+        {
+            uint32_t normalized = 0u;
+            if (!normalizeIopAddress(address, normalized) ||
+                static_cast<uint64_t>(normalized) + size > iopMemory.size())
+                return false;
+            std::fill(iopMemory.begin() + normalized, iopMemory.begin() + normalized + size, 0u);
+            return true;
+        }
+
+        bool normalizeIopAddress(uint32_t address, uint32_t &normalized) const override
+        {
+            const bool physical = address < 0x00200000u;
+            const bool cached = address >= 0x80000000u && address < 0x80200000u;
+            const bool uncached = address >= 0xA0000000u && address < 0xA0200000u;
+            if (!physical && !cached && !uncached)
+            {
+                normalized = 0u;
+                return false;
+            }
+            normalized = address & 0x1FFFFFFFu;
+            return normalized < iopMemory.size();
         }
 
         uint32_t allocateIopHandle(IopHandleKind kind) override
@@ -275,6 +322,7 @@ namespace
         }
 
         std::vector<uint8_t> memory;
+        std::vector<uint8_t> iopMemory;
         uint32_t nextHandle = 0x8000u;
         uint32_t nextGuestAddress = 0x4000u;
         std::vector<uint32_t> guestAllocations;
@@ -347,6 +395,57 @@ void register_ps2_iop_tests()
 {
     MiniTest::Case("PS2IopSubsystem", [](TestCase &tc)
     {
+        tc.Run("PS2 path parsing is shared and normalizes ISO/module names", [](TestCase &t)
+        {
+            const ps2x::iop::ParsedPs2Path cd = ps2x::iop::parsePs2Path("CDROM0:\\MODULES\\LIBSD.IRX;1");
+            t.Equals(cd.device, ps2x::iop::Ps2PathDevice::Cdrom,
+                     "device names should be case-insensitive");
+            t.Equals(cd.path, std::string("MODULES/LIBSD.IRX"),
+                     "separators and ISO version suffixes should normalize once");
+            t.Equals(ps2x::iop::ps2PathLeafKey(cd), std::string("libsd"),
+                     "module lookup should use a normalized IRX leaf key");
+
+            const ps2x::iop::ParsedPs2Path rom = ps2x::iop::parsePs2Path("rom0:ROMVER");
+            t.Equals(rom.device, ps2x::iop::Ps2PathDevice::Rom0,
+                     "ROM0 should remain a distinct virtual device");
+            t.IsFalse(static_cast<bool>(ps2x::iop::parsePs2Path("unknown0:file.irx")),
+                      "unsupported devices must not fall through to cdrom0");
+        });
+
+        tc.Run("HLE services activate only after a recognized module load", [](TestCase &t)
+        {
+            FakeIopHost host;
+            ps2x::iop::IopSubsystem subsystem(host);
+            std::string error;
+            t.IsTrue(subsystem.configure({"unmatched.elf", 0x100000u, 0u}, &error),
+                     "core-only IOP configuration should succeed");
+            t.IsFalse(subsystem.canBindRpc(0x80000701u),
+                      "LIBSD RPC must not exist before LIBSD is loaded");
+
+            const ps2x::iop::ModuleLoadResult unknown = subsystem.loadModule("rom0:NOT_A_REAL_MODULE");
+            t.IsTrue(unknown.handled, "the module manager should return a real load result");
+            t.IsTrue(unknown.moduleId < 0, "unknown ROM modules must fail instead of receiving fake IDs");
+
+            const ps2x::iop::ModuleLoadResult loaded = subsystem.loadModule("rom0:LIBSD");
+            t.IsTrue(loaded.moduleId > 0, "a registered no-BIOS HLE module should load");
+            t.IsTrue(subsystem.canBindRpc(0x80000701u),
+                     "loading LIBSD should activate its HLE RPC endpoint");
+
+            ps2x::iop::RpcRequest request{};
+            request.sid = 0x80000701u;
+            request.function = 3u;
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "the activated LIBSD service should handle its RPC");
+            t.Equals(host.audioCalls, 1u, "the RPC should reach the HLE audio contract");
+
+            int32_t stopResult = -1;
+            t.IsTrue(subsystem.stopModule(loaded.moduleId, &stopResult),
+                     "an HLE module should have a real stoppable lifecycle");
+            t.Equals(stopResult, 0, "stopping an HLE module should report success");
+            t.IsFalse(subsystem.canBindRpc(0x80000701u),
+                      "stopping LIBSD should deactivate its RPC endpoint");
+        });
+
         tc.Run("unknown SID remains unhandled without a matching profile", [](TestCase &t)
         {
             FakeIopHost host;
@@ -540,27 +639,27 @@ void register_ps2_iop_tests()
                      "TSNDDRV should handle the characterized command queue");
 
             int16_t writtenChecksum = 0;
-            t.IsTrue(host.readGuest(statusAddress + 0x26u,
-                                    &writtenChecksum,
-                                    sizeof(writtenChecksum)),
+            t.IsTrue(host.readIopMemory(statusAddress + 0x26u,
+                                       &writtenChecksum,
+                                       sizeof(writtenChecksum)),
                      "TSNDDRV SE checksum slot should be readable");
             t.Equals(writtenChecksum, kChecksum,
                      "valid port should mirror the profile-bound checksum table");
 
             constexpr uint32_t kPastStatusAddress = 0x44u;
             constexpr uint16_t kSentinel = 0xBEEFu;
-            t.IsTrue(host.writeGuest(statusAddress + kPastStatusAddress,
-                                     &kSentinel,
-                                     sizeof(kSentinel)),
+            t.IsTrue(host.writeIopMemory(statusAddress + kPastStatusAddress,
+                                        &kSentinel,
+                                        sizeof(kSentinel)),
                      "sentinel after the status structure should be writable");
             command[1] = 0x0Fu;
             (void)host.writeGuest(kCommandAddress, command.data(), command.size());
             (void)subsystem.handleRpc(commandRequest);
 
             uint16_t sentinelAfter = 0u;
-            (void)host.readGuest(statusAddress + kPastStatusAddress,
-                                 &sentinelAfter,
-                                 sizeof(sentinelAfter));
+            (void)host.readIopMemory(statusAddress + kPastStatusAddress,
+                                    &sentinelAfter,
+                                    sizeof(sentinelAfter));
             t.Equals(sentinelAfter, kSentinel,
                      "invalid port must not overwrite memory past the 0x42-byte status structure");
         });

@@ -333,6 +333,41 @@ void register_ps2_sif_rpc_tests()
                      "SifInitRpc must not reboot or reset the IOP");
         });
 
+        tc.Run("SifLoadModule validates ROM modules and activates their HLE service", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t kPathAddress = 0x00021000u;
+
+            const auto load = [&](std::string_view path)
+            {
+                std::memcpy(env.rdram.data() + kPathAddress, path.data(), path.size());
+                env.rdram[kPathAddress + path.size()] = 0u;
+                setRegU32(env.ctx, 4, kPathAddress);
+                setRegU32(env.ctx, 5, 0u);
+                setRegU32(env.ctx, 6, 0u);
+                SifLoadModule(env.rdram.data(), &env.ctx, &env.runtime);
+                return getRegS32(env.ctx, 2);
+            };
+
+            t.Equals(load("rom0:NOT_A_REAL_MODULE"), -1,
+                     "SifLoadModule must reject unknown ROM modules instead of fabricating success");
+
+            const int32_t libsdId = load("rom0:LIBSD");
+            t.IsTrue(libsdId > 0, "registered no-BIOS ROM module should receive a real managed ID");
+
+            const auto snapshot = env.runtime.iopDebugSnapshot();
+            bool libsdActive = false;
+            for (const auto &service : snapshot.services)
+            {
+                if (service.name == "libsd")
+                {
+                    libsdActive = service.active;
+                    break;
+                }
+            }
+            t.IsTrue(libsdActive, "loading LIBSD should activate its HLE RPC route");
+        });
+
         tc.Run("emulated RPC bind waits for a registered IOP server", [](TestCase &t)
         {
             TestEnv env;
@@ -511,6 +546,8 @@ void register_ps2_sif_rpc_tests()
         tc.Run("MCSERV RPC init and get info report a formatted PS2 card", [](TestCase &t)
         {
             TestEnv env;
+            const auto mcservModule = env.runtime.loadIopModule("rom0:MCSERV");
+            t.IsTrue(mcservModule.moduleId > 0, "MCSERV test should load its IOP module first");
             ScopedTempDir temp("mcserv_rpc");
 
             const PS2Runtime::IoPaths oldPaths = PS2Runtime::getIoPaths();
@@ -569,6 +606,8 @@ void register_ps2_sif_rpc_tests()
         tc.Run("DBCMAN version RPC returns the 3.20 compatibility response", [](TestCase &t)
         {
             TestEnv env;
+            const auto dbcmanModule = env.runtime.loadIopModule("rom0:DBCMAN");
+            t.IsTrue(dbcmanModule.moduleId > 0, "DBCMAN test should load its IOP module first");
 
             constexpr uint32_t kDbcManSid = 0x80001300u;
             constexpr uint32_t kCheckVersionRpc = 0x80001363u;
@@ -594,6 +633,8 @@ void register_ps2_sif_rpc_tests()
         tc.Run("LIBSD RPC routes through the IOP audio service", [](TestCase &t)
         {
             TestEnv env;
+            const auto libsdModule = env.runtime.loadIopModule("rom0:LIBSD");
+            t.IsTrue(libsdModule.moduleId > 0, "LIBSD test should load its IOP module first");
 
             constexpr uint32_t kSetVoiceRpc = 0x8010u;
             constexpr uint32_t kSendAddr = 0x00035B00u;
@@ -1092,9 +1133,14 @@ void register_ps2_sif_rpc_tests()
             t.IsTrue(addrTableAddr > 0u && addrTableAddr < 0x00200000u,
                      "rpc 0x13 should return a low guest address like an IOP pointer");
 
-            const uint32_t hdBaseAddr = readGuestStruct<uint32_t>(env.rdram.data(), addrTableAddr + 0u);
-            const uint32_t sqBaseAddr = readGuestStruct<uint32_t>(env.rdram.data(), addrTableAddr + 4u);
-            const uint32_t dataBaseAddr = readGuestStruct<uint32_t>(env.rdram.data(), addrTableAddr + 8u);
+            std::array<uint32_t, 3> addressTable{};
+            t.IsTrue(env.runtime.readIopMemory(addrTableAddr,
+                                               addressTable.data(),
+                                               sizeof(addressTable)),
+                     "the sound-driver address table should live in physical IOP RAM");
+            const uint32_t hdBaseAddr = addressTable[0];
+            const uint32_t sqBaseAddr = addressTable[1];
+            const uint32_t dataBaseAddr = addressTable[2];
             t.IsTrue(hdBaseAddr > 0u && hdBaseAddr < 0x00200000u,
                      "sound-driver hd base should stay in low guest address space");
             t.IsTrue(sqBaseAddr > hdBaseAddr && sqBaseAddr < 0x00200000u,

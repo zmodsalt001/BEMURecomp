@@ -111,6 +111,12 @@ namespace
         return value;
     }
 
+    void writeIopS16(PS2Runtime &runtime, uint32_t addr, int16_t value)
+    {
+        if (!runtime.writeIopMemory(addr, &value, sizeof(value)))
+            throw std::runtime_error("failed to write IOP test memory");
+    }
+
     uint32_t g_dmacHandlerWriteAddr = 0u;
     uint32_t g_dmacHandlerValue = 0u;
     uint32_t g_dmacHandlerLastCause = 0u;
@@ -176,7 +182,7 @@ void register_ps2_sif_dma_tests()
                 payload[i] = static_cast<uint8_t>(0x30u + i);
             }
             std::memcpy(env.rdram.data() + kSrcAddr, payload.data(), payload.size());
-            std::memset(env.rdram.data() + kDstAddr, 0, payload.size());
+            std::memset(env.rdram.data() + kDstAddr, 0x5A, payload.size());
 
             const Ps2SifDmaTransfer desc{
                 kSrcAddr,
@@ -191,8 +197,15 @@ void register_ps2_sif_dma_tests()
             const int32_t dmaId = getRegS32(env.ctx, 2);
             t.IsTrue(dmaId > 0, "sceSifSetDma should return a positive transfer id on success");
 
-            t.IsTrue(std::memcmp(env.rdram.data() + kDstAddr, payload.data(), payload.size()) == 0,
-                     "sceSifSetDma should copy transfer payload to destination");
+            std::array<uint8_t, 16> iopReadback{};
+            t.IsTrue(env.runtime.readIopMemory(kDstAddr, iopReadback.data(), iopReadback.size()) &&
+                         iopReadback == payload,
+                     "sceSifSetDma should copy EE payload into IOP RAM");
+            const std::array<uint8_t, 16> eeSentinel = {
+                0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A,
+                0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A};
+            t.IsTrue(std::memcmp(env.rdram.data() + kDstAddr, eeSentinel.data(), eeSentinel.size()) == 0,
+                     "sceSifSetDma must not alias an equal-numbered EE address");
 
             setRegU32(env.ctx, 4, static_cast<uint32_t>(dmaId));
             ps2_stubs::sceSifDmaStat(env.rdram.data(), &env.ctx, &env.runtime);
@@ -206,7 +219,6 @@ void register_ps2_sif_dma_tests()
             constexpr uint32_t kDescAddr = 0x00020040u;
             constexpr uint32_t kSrcAddr = 0x00020140u;
             constexpr uint32_t kRoundTripAddr = 0x00020240u;
-            constexpr uint32_t kFormerAliasAddr = 0x01A53880u;
             constexpr uint32_t kIopBlockSize = 0x880u;
 
             std::array<uint8_t, 32> payload{};
@@ -216,13 +228,13 @@ void register_ps2_sif_dma_tests()
             }
             std::memcpy(env.rdram.data() + kSrcAddr, payload.data(), payload.size());
             std::memset(env.rdram.data() + kRoundTripAddr, 0, payload.size());
-            std::memset(env.rdram.data() + kFormerAliasAddr, 0x5Au, payload.size());
 
             setRegU32(env.ctx, 4, kIopBlockSize);
             ps2_stubs::sceSifAllocIopHeap(env.rdram.data(), &env.ctx, &env.runtime);
             const uint32_t iopAddress = ::getRegU32(&env.ctx, 2);
-            t.IsTrue(iopAddress >= PS2_RAM_SIZE,
-                     "sceSifAllocIopHeap should return an address outside EE RDRAM");
+            t.IsTrue(iopAddress >= 0x00120000u && iopAddress < 0x00200000u,
+                     "sceSifAllocIopHeap should return an address in physical IOP RAM");
+            std::memset(env.rdram.data() + iopAddress, 0x5Au, payload.size());
 
             Ps2SifDmaTransfer desc{
                 kSrcAddr,
@@ -241,32 +253,25 @@ void register_ps2_sif_dma_tests()
                 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A,
                 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A,
                 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A};
-            t.IsTrue(std::memcmp(env.rdram.data() + kFormerAliasAddr,
+            t.IsTrue(std::memcmp(env.rdram.data() + iopAddress,
                                  aliasSentinel.data(), aliasSentinel.size()) == 0,
-                     "IOP DMA must not overwrite the old 0x01A00000 EE alias range");
+                     "IOP DMA must not overwrite the equal-numbered EE range");
 
             PS2IopHostAdapter host(env.runtime);
             auto scope = host.enterCall(&env.ctx, env.rdram.data());
-            uint32_t normalized = 0u;
             std::array<uint8_t, 32> hostReadback{};
-            t.IsTrue(host.normalizeGuestAddress(iopAddress, normalized) &&
-                         normalized == iopAddress,
-                     "IOP modules should preserve private IOP heap addresses");
-            t.IsTrue(host.readGuest(iopAddress, hostReadback.data(), hostReadback.size()) &&
+            t.IsTrue(host.readIopMemory(iopAddress, hostReadback.data(), hostReadback.size()) &&
                          hostReadback == payload,
-                     "IOP modules should read the private heap backing");
+                     "IOP modules should read the shared physical IOP RAM");
 
-            desc = {
-                iopAddress,
-                kRoundTripAddr,
-                static_cast<int32_t>(payload.size()),
-                0};
-            std::memcpy(env.rdram.data() + kDescAddr, &desc, sizeof(desc));
-            setRegU32(env.ctx, 4, kDescAddr);
-            setRegU32(env.ctx, 5, 1u);
-            ps2_stubs::sceSifSetDma(env.rdram.data(), &env.ctx, &env.runtime);
-            t.IsTrue(getRegS32(env.ctx, 2) > 0,
-                     "IOP-to-EE DMA should accept a private IOP heap source");
+            constexpr uint32_t kRdAddr = 0x00020340u;
+            setRegU32(env.ctx, 4, kRdAddr);
+            setRegU32(env.ctx, 5, iopAddress);
+            setRegU32(env.ctx, 6, kRoundTripAddr);
+            setRegU32(env.ctx, 7, static_cast<uint32_t>(payload.size()));
+            ps2_stubs::sceSifGetOtherData(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), 0,
+                     "IOP-to-EE transfer should accept a physical IOP source");
             t.IsTrue(std::memcmp(env.rdram.data() + kRoundTripAddr,
                                  payload.data(), payload.size()) == 0,
                      "IOP-to-EE DMA should round-trip the payload");
@@ -286,7 +291,7 @@ void register_ps2_sif_dma_tests()
                 payload[i] = static_cast<uint8_t>(0x50u + i);
             }
             std::memcpy(env.rdram.data() + kSrcAddr, payload.data(), payload.size());
-            std::memset(env.rdram.data() + kDstAddr, 0, payload.size());
+            std::memset(env.rdram.data() + kDstAddr, 0x5A, payload.size());
 
             const Ps2SifDmaTransfer desc{
                 kSrcAddr,
@@ -299,8 +304,10 @@ void register_ps2_sif_dma_tests()
             setRegU32(env.ctx, 5, 1u);
             ps2_stubs::isceSifSetDma(env.rdram.data(), &env.ctx, &env.runtime);
             t.IsTrue(getRegS32(env.ctx, 2) > 0, "isceSifSetDma should report a successful transfer id");
-            t.IsTrue(std::memcmp(env.rdram.data() + kDstAddr, payload.data(), payload.size()) == 0,
-                     "isceSifSetDma should copy transfer payload like sceSifSetDma");
+            std::array<uint8_t, 12> iopReadback{};
+            t.IsTrue(env.runtime.readIopMemory(kDstAddr, iopReadback.data(), iopReadback.size()) &&
+                         iopReadback == payload,
+                     "isceSifSetDma should copy EE payload into IOP RAM");
 
             ps2_stubs::isceSifSetDChain(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), 0, "isceSifSetDChain should mirror sceSifSetDChain");
@@ -958,7 +965,8 @@ void register_ps2_sif_dma_tests()
             {
                 payload[i] = static_cast<uint8_t>((i * 7u) & 0xFFu);
             }
-            std::memcpy(env.rdram.data() + kSrcAddr, payload.data(), payload.size());
+            t.IsTrue(env.runtime.writeIopMemory(kSrcAddr, payload.data(), payload.size()),
+                     "test setup should populate physical IOP RAM");
             std::memset(env.rdram.data() + kDstAddr, 0, payload.size());
             std::memset(env.rdram.data() + kRdAddr, 0, sizeof(SifRpcReceiveData));
 
@@ -1017,8 +1025,8 @@ void register_ps2_sif_dma_tests()
             std::memset(env.rdram.data() + kDstAddr, 0, kSize);
             std::memset(env.rdram.data() + kRdAddr, 0, sizeof(SifRpcReceiveData));
 
-            writeGuestS16(env.rdram.data(), kSrcAddr + kSeSumOffset + (kBank * 2u), static_cast<int16_t>(0x1357));
-            writeGuestS16(env.rdram.data(), kSrcAddr + kMidiSumOffset + (kBank * 2u), static_cast<int16_t>(0x2468));
+            writeIopS16(env.runtime, kSrcAddr + kSeSumOffset + (kBank * 2u), static_cast<int16_t>(0x1357));
+            writeIopS16(env.runtime, kSrcAddr + kMidiSumOffset + (kBank * 2u), static_cast<int16_t>(0x2468));
 
             writeGuestS16(env.rdram.data(), kPrimarySeCheckAddr + (kBank * 2u), static_cast<int16_t>(0x7B7B));
             writeGuestS16(env.rdram.data(), kPrimaryMidiCheckAddr + (kBank * 2u), static_cast<int16_t>(0x6A6A));
@@ -1078,8 +1086,8 @@ void register_ps2_sif_dma_tests()
             std::memset(env.rdram.data() + kDstAddr, 0, kSize);
             std::memset(env.rdram.data() + kRdAddr, 0, sizeof(SifRpcReceiveData));
 
-            writeGuestS16(env.rdram.data(), kSrcAddr + kSeSumOffset + (kLiveBank * 2u), static_cast<int16_t>(0x1111));
-            writeGuestS16(env.rdram.data(), kSrcAddr + kMidiSumOffset + (kLiveBank * 2u), static_cast<int16_t>(0x2222));
+            writeIopS16(env.runtime, kSrcAddr + kSeSumOffset + (kLiveBank * 2u), static_cast<int16_t>(0x1111));
+            writeIopS16(env.runtime, kSrcAddr + kMidiSumOffset + (kLiveBank * 2u), static_cast<int16_t>(0x2222));
 
             writeGuestS16(env.rdram.data(), kPrimarySeCheckAddr + (kPendingBank * 2u), static_cast<int16_t>(0x3333));
             writeGuestS16(env.rdram.data(), kPrimaryMidiCheckAddr + (kPendingBank * 2u), static_cast<int16_t>(0x4444));

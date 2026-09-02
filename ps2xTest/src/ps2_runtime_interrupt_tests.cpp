@@ -8,7 +8,9 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace ps2_syscalls;
@@ -67,6 +69,9 @@ namespace
     constexpr uint32_t kTimer2WaitPc = 0x00160500u;
     constexpr uint32_t kTimer2ResumePc = 0x00160510u;
     constexpr uint32_t kTimer2HandlerPc = 0x00160520u;
+    constexpr uint32_t kInvocationQueuePc = 0x00160530u;
+    constexpr uint32_t kInvocationQueueResumePc = 0x00160540u;
+    constexpr uint32_t kInvocationQueueHandlerPc = 0x00160550u;
 
     constexpr uint32_t kTimer2Count = 0x10001000u;
     constexpr uint32_t kTimer2Mode = 0x10001010u;
@@ -89,6 +94,9 @@ namespace
     uint64_t g_vsyncCsr = 0;
     std::atomic<bool> g_timer2Resumed{false};
     uint32_t g_irqObservedSp = 0u;
+    uint32_t g_invocationQueueRuns = 0u;
+    uint32_t g_invocationQueueSp = 0u;
+    bool g_invocationQueueSpChanged = false;
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -328,6 +336,43 @@ namespace
         ctx->pc = 0u;
         runtime->requestStop();
     }
+
+    void schedulerInvocationQueueHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        const uint32_t sp = getRegU32(ctx, 29);
+        if (g_invocationQueueSp == 0u)
+        {
+            g_invocationQueueSp = sp;
+        }
+        else if (g_invocationQueueSp != sp)
+        {
+            g_invocationQueueSpChanged = true;
+        }
+        ++g_invocationQueueRuns;
+        ctx->pc = 0u;
+    }
+
+    void schedulerQueueManyInvocations(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        constexpr uint32_t kInvocationCount = 96u;
+        EeScheduler &scheduler = runtime->eeScheduler();
+        for (uint32_t i = 0u; i < kInvocationCount; ++i)
+        {
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::Interrupt;
+            invocation.tag = i;
+            invocation.context.pc = kInvocationQueueHandlerPc;
+            setRegU32(invocation.context, 31, 0u);
+            scheduler.queueInvocation(std::move(invocation));
+        }
+        ctx->pc = kInvocationQueueResumePc;
+    }
+
+    void schedulerInvocationQueueResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
 }
 
 void register_ps2_runtime_interrupt_tests()
@@ -525,6 +570,36 @@ void register_ps2_runtime_interrupt_tests()
                      "IRQ handler must not reuse the transient stack captured at registration");
             t.Equals(guardAfter, guard,
                      "IRQ handler stack writes must not clobber the registering thread's live frame");
+        });
+
+        tc.Run("pending async callbacks execute sequentially on a reusable invocation stack", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kInvocationQueuePc, schedulerQueueManyInvocations);
+            env.runtime.registerFunction(kInvocationQueueResumePc, schedulerInvocationQueueResume);
+            env.runtime.registerFunction(kInvocationQueueHandlerPc, schedulerInvocationQueueHandler);
+
+            g_invocationQueueRuns = 0u;
+            g_invocationQueueSp = 0u;
+            g_invocationQueueSpChanged = false;
+
+            R5900Context mainContext{};
+            mainContext.pc = kInvocationQueuePc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+
+            bool exhausted = false;
+            try
+            {
+                env.runtime.eeScheduler().run();
+            }
+            catch (const std::runtime_error &error)
+            {
+                exhausted = std::string_view(error.what()) == "EE invocation stack space exhausted";
+            }
+
+            t.IsFalse(exhausted, "queued callbacks must not consume one invocation stack per pending item");
+            t.Equals(g_invocationQueueRuns, 96u, "every queued callback should execute exactly once");
+            t.IsFalse(g_invocationQueueSpChanged, "sequential callbacks should reuse the same stack depth");
         });
 
         tc.Run("iSignalSema defers selection until IRQ return", [](TestCase &t)
