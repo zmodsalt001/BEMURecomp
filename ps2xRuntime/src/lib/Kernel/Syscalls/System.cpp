@@ -250,32 +250,6 @@ namespace ps2_syscalls
         setReturnS32(ctx, 0);
     }
 
-    void GetRomName(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        uint32_t bufAddr = getRegU32(ctx, 4); // $a0
-        size_t bufSize = getRegU32(ctx, 5);   // $a1
-        char *hostBuf = reinterpret_cast<char *>(getMemPtr(rdram, bufAddr));
-        const char *romName = "ROMVER 0100";
-
-        if (!hostBuf)
-        {
-            std::cerr << "GetRomName error: Invalid buffer address" << std::endl;
-            setReturnS32(ctx, -1); // Error
-            return;
-        }
-        if (bufSize == 0)
-        {
-            setReturnS32(ctx, 0);
-            return;
-        }
-
-        strncpy(hostBuf, romName, bufSize - 1);
-        hostBuf[bufSize - 1] = '\0';
-
-        // returns the length of the string (excluding null?) or error
-        setReturnS32(ctx, (int32_t)strlen(hostBuf));
-    }
-
     void SifLoadElfPart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t pathAddr = getRegU32(ctx, 4);     // $a0 - path
@@ -331,39 +305,22 @@ namespace ps2_syscalls
             return;
         }
 
-        const auto emulated = runtime->loadIopModuleBuffer(bufferAddr, arguments.empty() ? nullptr : arguments.data(), static_cast<uint32_t>(arguments.size()));
-        if (emulated.handled)
-        {
-            if (emulated.moduleId <= 0)
-            {
-                setReturnS32(ctx, -1);
-                return;
-            }
-            trackSifModuleLoadExternal(moduleTag, emulated.moduleId);
-            logSifModuleAction("load-buffer-emulated", emulated.moduleId, moduleTag, 1u);
-            setReturnS32(ctx, emulated.moduleId);
-            return;
-        }
-
-        // Profile mode keeps the existing deterministic synthetic IDs.
-        const int32_t moduleId = trackSifModuleLoad(moduleTag);
-        if (moduleId <= 0)
+        if (!runtime)
         {
             setReturnS32(ctx, -1);
             return;
         }
 
-        uint32_t refs = 0;
+        const auto loaded = runtime->loadIopModuleBuffer(bufferAddr, arguments.empty() ? nullptr : arguments.data(), static_cast<uint32_t>(arguments.size()));
+        if (!loaded.handled || loaded.moduleId <= 0)
         {
-            std::lock_guard<std::mutex> lock(g_sif_module_mutex);
-            auto it = g_sif_modules_by_id.find(moduleId);
-            if (it != g_sif_modules_by_id.end())
-            {
-                refs = it->second.refCount;
-            }
+            setReturnS32(ctx, -1);
+            return;
         }
-        logSifModuleAction("load-buffer", moduleId, moduleTag, refs);
-        setReturnS32(ctx, moduleId);
+
+        trackSifModuleLoadExternal(moduleTag, loaded.moduleId);
+        logSifModuleAction("load-buffer-emulated", loaded.moduleId, moduleTag, 1u);
+        setReturnS32(ctx, loaded.moduleId);
     }
 
     void TODO(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t encodedSyscallId)

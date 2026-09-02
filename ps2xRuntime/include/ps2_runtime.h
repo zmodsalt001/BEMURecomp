@@ -31,6 +31,8 @@
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_pad.h"
+#include "runtime/ps2_rom_device.h"
+#include "runtime/ps2_vfs.h"
 #include "ps2x/iop/iop_types.h"
 
 namespace ps2x::iop
@@ -293,6 +295,12 @@ public:
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
     [[nodiscard]] bool stopIopModule(int32_t moduleId, int32_t *result = nullptr);
     [[nodiscard]] ps2x::iop::DebugSnapshot iopDebugSnapshot() const;
+    uint32_t allocateIopMemory(uint32_t size, uint32_t alignment = 16u);
+    bool freeIopMemory(uint32_t address);
+    bool readIopMemory(uint32_t address, void *destination, size_t size) const;
+    bool writeIopMemory(uint32_t address, const void *source, size_t size);
+    bool zeroIopMemory(uint32_t address, size_t size);
+    bool isIopMemoryRange(uint32_t address, size_t size) const;
 
     using DebugUiCallback = void (*)(PS2Runtime &runtime, void *userData);
     void setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -444,6 +452,10 @@ public:
     inline const PS2AudioBackend &audioBackend() const { return m_audioBackend; }
     inline PSPadBackend &padBackend() { return m_padBackend; }
     inline const PSPadBackend &padBackend() const { return m_padBackend; }
+    inline PS2RomDevice &romDevice() { return m_romDevice; }
+    inline const PS2RomDevice &romDevice() const { return m_romDevice; }
+    inline PS2Vfs &vfs() { return m_vfs; }
+    inline const PS2Vfs &vfs() const { return m_vfs; }
 
 private:
     struct GuestHeapBlock
@@ -484,6 +496,8 @@ private:
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
+    PS2RomDevice m_romDevice;
+    PS2Vfs m_vfs;
     VU1Interpreter m_vu0{VU1Interpreter::Unit::VU0};
     VU1Interpreter m_vu1{VU1Interpreter::Unit::VU1};
     R5900Context m_cpuContext;

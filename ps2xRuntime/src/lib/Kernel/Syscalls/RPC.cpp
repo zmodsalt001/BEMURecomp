@@ -207,40 +207,22 @@ namespace ps2_syscalls
             return;
         }
 
-        const auto emulated = runtime->loadIopModule(modulePath, arguments.empty() ? nullptr : arguments.data(), static_cast<uint32_t>(arguments.size()));
-        if (emulated.handled)
-        {
-            if (emulated.moduleId <= 0)
-            {
-                setReturnS32(ctx, -1);
-                return;
-            }
-
-            trackSifModuleLoadExternal(modulePath, emulated.moduleId);
-            logSifModuleAction("load-emulated", emulated.moduleId, modulePath, 1u);
-            setReturnS32(ctx, emulated.moduleId);
-            return;
-        }
-
-        const int32_t moduleId = trackSifModuleLoad(modulePath);
-        if (moduleId <= 0)
+        if (!runtime)
         {
             setReturnS32(ctx, -1);
             return;
         }
 
-        uint32_t refs = 0;
+        const auto loaded = runtime->loadIopModule(modulePath, arguments.empty() ? nullptr : arguments.data(), static_cast<uint32_t>(arguments.size()));
+        if (!loaded.handled || loaded.moduleId <= 0)
         {
-            std::lock_guard<std::mutex> lock(g_sif_module_mutex);
-            auto it = g_sif_modules_by_id.find(moduleId);
-            if (it != g_sif_modules_by_id.end())
-            {
-                refs = it->second.refCount;
-            }
+            setReturnS32(ctx, -1);
+            return;
         }
-        logSifModuleAction("load", moduleId, modulePath, refs);
 
-        setReturnS32(ctx, moduleId);
+        trackSifModuleLoadExternal(modulePath, loaded.moduleId);
+        logSifModuleAction("load-emulated", loaded.moduleId, modulePath, 1u);
+        setReturnS32(ctx, loaded.moduleId);
     }
 
     void SifInitRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

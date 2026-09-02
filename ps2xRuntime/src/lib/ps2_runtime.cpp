@@ -630,6 +630,36 @@ ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
     return m_iopSubsystem->debugSnapshot();
 }
 
+uint32_t PS2Runtime::allocateIopMemory(uint32_t size, uint32_t alignment)
+{
+    return m_iopSubsystem ? m_iopSubsystem->allocateMemory(size, alignment) : 0u;
+}
+
+bool PS2Runtime::freeIopMemory(uint32_t address)
+{
+    return m_iopSubsystem && m_iopSubsystem->freeMemory(address);
+}
+
+bool PS2Runtime::readIopMemory(uint32_t address, void *destination, size_t size) const
+{
+    return m_iopSubsystem && m_iopSubsystem->readMemory(address, destination, size);
+}
+
+bool PS2Runtime::writeIopMemory(uint32_t address, const void *source, size_t size)
+{
+    return m_iopSubsystem && m_iopSubsystem->writeMemory(address, source, size);
+}
+
+bool PS2Runtime::zeroIopMemory(uint32_t address, size_t size)
+{
+    return m_iopSubsystem && m_iopSubsystem->zeroMemory(address, size);
+}
+
+bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
+{
+    return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
+}
+
 bool PS2Runtime::syncCoreSubsystems()
 {
     uint8_t *const rdram = m_memory.getRDRAM();
@@ -983,6 +1013,12 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     identity.elfName = module.name;
     identity.entryPoint = m_cpuContext.pc;
     identity.crc32 = elfCrc32;
+    std::string romError;
+    if (!m_romDevice.configure(identity, &romError))
+    {
+        std::cerr << "[ROM0] failed to configure profile: " << romError << std::endl;
+        return false;
+    }
     std::string iopError;
     if (!m_iopSubsystem->configure(identity, &iopError))
     {
@@ -1374,7 +1410,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         if (policy == MissingFunctionPolicy::ContinueToTarget)
         {
             ctx->pc = targetPc;
-            return true;
+            // if you need the app to keep open to open debug pannel change this to false
+            return false;
         }
 
         return false;
@@ -2403,6 +2440,7 @@ void PS2Runtime::run()
                                                << " gsw=" << curGs
                                                << " vif=" << curVif
                                                << std::endl);
+
             }
         });
         uint32_t presentWidth = FB_WIDTH;

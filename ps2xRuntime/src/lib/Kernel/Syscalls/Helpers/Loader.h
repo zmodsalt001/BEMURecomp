@@ -105,52 +105,6 @@ namespace
         ++g_sif_module_log_count;
     }
 
-    int32_t trackSifModuleLoad(const std::string &path)
-    {
-        if (path.empty())
-        {
-            return -1;
-        }
-
-        const std::string pathKey = normalizeSifModulePathKey(path);
-        if (pathKey.empty())
-        {
-            return -1;
-        }
-
-        std::lock_guard<std::mutex> lock(g_sif_module_mutex);
-
-        auto byPathIt = g_sif_module_id_by_path.find(pathKey);
-        if (byPathIt != g_sif_module_id_by_path.end())
-        {
-            auto byIdIt = g_sif_modules_by_id.find(byPathIt->second);
-            if (byIdIt != g_sif_modules_by_id.end())
-            {
-                SifModuleRecord &record = byIdIt->second;
-                record.loaded = true;
-                ++record.refCount;
-                return record.id;
-            }
-        }
-
-        if (g_next_sif_module_id <= 0)
-        {
-            g_next_sif_module_id = 1;
-        }
-
-        const int32_t moduleId = g_next_sif_module_id++;
-        SifModuleRecord record;
-        record.id = moduleId;
-        record.path = path;
-        record.pathKey = pathKey;
-        record.refCount = 1;
-        record.loaded = true;
-
-        g_sif_module_id_by_path[pathKey] = moduleId;
-        g_sif_modules_by_id[moduleId] = record;
-        return moduleId;
-    }
-
     int32_t trackSifModuleLoadExternal(const std::string &path, int32_t moduleId)
     {
         if (path.empty() || moduleId <= 0)
