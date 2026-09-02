@@ -288,7 +288,8 @@ namespace ps2recomp
             std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions,
             const std::vector<Section> &sections,
             CodeGenerator *codeGenerator,
-            const std::function<bool(Function &)> &decodeExternalFunction)
+            const std::function<bool(Function &)> &decodeExternalFunction,
+            const std::unordered_set<uint32_t> &seedEntryAddresses = {})
         {
             std::unordered_set<uint32_t> existingStarts;
             for (const auto &function : functions)
@@ -310,6 +311,19 @@ namespace ps2recomp
                     }
                 }
                 return false;
+            };
+
+            auto executableSectionEnd = [&](uint32_t address) -> std::optional<uint32_t>
+            {
+                for (const auto &section : sections)
+                {
+                    if (!section.isCode || address < section.address || address >= section.address + section.size)
+                    {
+                        continue;
+                    }
+                    return section.address + section.size;
+                }
+                return std::nullopt;
             };
 
             auto isSimpleReturnThunkStart = [](const Instruction &inst) -> bool
@@ -396,6 +410,14 @@ namespace ps2recomp
                     pendingEntries.push_back(pending);
                     pendingStarts.insert(target);
                 };
+
+                if (stats.passCount == 1u)
+                {
+                    for (uint32_t target : seedEntryAddresses)
+                    {
+                        queuePendingEntry(target);
+                    }
+                }
 
                 for (const auto &function : functions)
                 {
@@ -534,13 +556,24 @@ namespace ps2recomp
                     }
                     else
                     {
-                        auto nextStartOpt = findNextBoundaryStart(target);
-                        if (!nextStartOpt.has_value() || nextStartOpt.value() <= target)
+                        const auto sectionEndOpt = executableSectionEnd(target);
+                        if (!sectionEndOpt.has_value())
                         {
                             continue;
                         }
 
-                        entryFunction.end = nextStartOpt.value();
+                        uint32_t entryEnd = sectionEndOpt.value();
+                        auto nextStartOpt = findNextBoundaryStart(target);
+                        if (nextStartOpt.has_value() && nextStartOpt.value() < entryEnd)
+                        {
+                            entryEnd = nextStartOpt.value();
+                        }
+                        if (entryEnd <= target)
+                        {
+                            continue;
+                        }
+
+                        entryFunction.end = entryEnd;
                         if (!decodeExternalFunction(entryFunction))
                         {
                             continue;
@@ -1869,6 +1902,63 @@ namespace ps2recomp
             return;
         }
 
+        std::unordered_set<uint32_t> guestFallbackEntryAddresses = m_entryPointHintStarts;
+        for (uint32_t address : m_stubFunctionStarts)
+        {
+            const auto bindingIt = m_stubHandlerBindingsByStart.find(address);
+            if (bindingIt == m_stubHandlerBindingsByStart.end() ||
+                resolveStubTarget(bindingIt->second) == StubTarget::Unknown)
+            {
+                guestFallbackEntryAddresses.insert(address);
+            }
+        }
+
+        // Prefer the existing wrapper when a configured entry lies inside a
+        // decoded function. If Ghidra/analyzer omitted the whole routine,
+        // synthesize a standalone guest function bounded by the next known
+        // function instead of leaving a valid executable target unregistered.
+        collectInternalEntryTargetsImpl(m_functions, m_decodedFunctions, guestFallbackEntryAddresses, m_resumeEntryTargetsByOwner);
+
+        std::unordered_set<uint32_t> coveredEntryAddresses;
+        coveredEntryAddresses.reserve(m_functions.size() + guestFallbackEntryAddresses.size());
+        for (const auto &function : m_functions)
+        {
+            coveredEntryAddresses.insert(function.start);
+        }
+        for (const auto &[owner, targets] : m_resumeEntryTargetsByOwner)
+        {
+            coveredEntryAddresses.insert(targets.begin(), targets.end());
+        }
+
+        std::unordered_set<uint32_t> standaloneEntryAddresses;
+        for (uint32_t address : guestFallbackEntryAddresses)
+        {
+            if (!coveredEntryAddresses.contains(address))
+            {
+                standaloneEntryAddresses.insert(address);
+            }
+        }
+
+        if (!standaloneEntryAddresses.empty())
+        {
+            const EntryDiscoveryStats configuredStats = discoverAdditionalEntryPointsImpl(
+                m_functions,
+                m_decodedFunctions,
+                m_sections,
+                nullptr,
+                [this](Function &function)
+                { return decodeFunction(function); },
+                standaloneEntryAddresses);
+            if (configuredStats.discoveredCount > 0u)
+            {
+                m_reporter.recordAdditionalEntryPoints(configuredStats.discoveredCount);
+                std::ostringstream msg;
+                msg << "synthesized " << configuredStats.discoveredCount
+                    << " standalone configured guest entry point(s)";
+                m_reporter.progress(msg.str());
+            }
+        }
+
         auto findContainingFunction = [&](uint32_t address) -> const Function *
         {
             const Function *best = nullptr;
@@ -1959,22 +2049,6 @@ namespace ps2recomp
                 targets.push_back(target);
             }
         }
-        
-        std::unordered_set<uint32_t> guestFallbackEntryAddresses = m_entryPointHintStarts;
-        for (uint32_t address : m_stubFunctionStarts)
-        {
-            const auto bindingIt = m_stubHandlerBindingsByStart.find(address);
-            if (bindingIt == m_stubHandlerBindingsByStart.end() ||
-                resolveStubTarget(bindingIt->second) == StubTarget::Unknown)
-            {
-                guestFallbackEntryAddresses.insert(address);
-            }
-        }
-        collectInternalEntryTargetsImpl(
-            m_functions,
-            m_decodedFunctions,
-            guestFallbackEntryAddresses,
-            m_resumeEntryTargetsByOwner);
 
         size_t totalTargets = 0u;
         for (auto it = m_resumeEntryTargetsByOwner.begin(); it != m_resumeEntryTargetsByOwner.end();)
