@@ -52,6 +52,19 @@ namespace ps2x::iop::detail
             return host.writeGuest(address, &value, sizeof(value));
         }
 
+        template <typename T>
+        bool readIopPod(const IopHost &host, uint32_t address, T &value)
+        {
+            value = {};
+            return host.readIopMemory(address, &value, sizeof(value));
+        }
+
+        template <typename T>
+        bool writeIopPod(IopHost &host, uint32_t address, const T &value)
+        {
+            return host.writeIopMemory(address, &value, sizeof(value));
+        }
+
         template <typename T, size_t Size>
         bool hasAnyNonZero(const std::array<T, Size> &values)
         {
@@ -174,9 +187,7 @@ namespace ps2x::iop::detail
                     handleCommandBuffer(request.send);
                     result.handled = true;
                 }
-                else if (request.sid == kStateSid &&
-                         (request.function == kGetStatusAddressFunction ||
-                          request.function == kGetAddressTableFunction))
+                else if (request.sid == kStateSid && (request.function == kGetStatusAddressFunction || request.function == kGetAddressTableFunction))
                 {
                     uint32_t responseAddress = 0u;
                     {
@@ -195,8 +206,7 @@ namespace ps2x::iop::detail
                         (void)writeGuestPod(m_host, request.receive.address, responseAddress);
                         if (request.receive.size > sizeof(uint32_t))
                         {
-                            (void)m_host.zeroGuest(request.receive.address + sizeof(uint32_t),
-                                                   request.receive.size - sizeof(uint32_t));
+                            (void)m_host.zeroGuest(request.receive.address + sizeof(uint32_t), request.receive.size - sizeof(uint32_t));
                         }
                         result.resultAddress = request.receive.address;
                     }
@@ -210,7 +220,8 @@ namespace ps2x::iop::detail
                     const auto rule = std::find_if(
                         m_bindings.completionRules.begin(),
                         m_bindings.completionRules.end(),
-                        [&](const TsnddrvCompletionRule &candidate) {
+                        [&](const TsnddrvCompletionRule &candidate)
+                        {
                             return candidate.eeFunction == request.endFunction;
                         });
                     if (rule != m_bindings.completionRules.end())
@@ -223,9 +234,7 @@ namespace ps2x::iop::detail
                         if (rule->clearBusy)
                         {
                             constexpr uint32_t idle = 0u;
-                            (void)writeGuestPod(m_host,
-                                                m_bindings.busyFlagAddress,
-                                                idle);
+                            (void)writeGuestPod(m_host, m_bindings.busyFlagAddress, idle);
                         }
                     }
                 }
@@ -280,15 +289,10 @@ namespace ps2x::iop::detail
                 {
                     const TsnddrvGuestArena &arena = m_bindings.arena;
                     const uint32_t statusAddress = alignUp(arena.base, arena.statusAlignment);
-                    const uint32_t addressTableAddress =
-                        alignUp(statusAddress + kStatusSize, arena.tableAlignment);
-                    const uint32_t hdBaseAddress =
-                        alignUp(addressTableAddress + (kAddressTableEntries * sizeof(uint32_t)),
-                                arena.storageAlignment);
-                    const uint32_t sqBaseAddress =
-                        alignUp(hdBaseAddress + arena.hdBytes, arena.storageAlignment);
-                    const uint32_t dataBaseAddress =
-                        alignUp(sqBaseAddress + arena.sqBytes, arena.storageAlignment);
+                    const uint32_t addressTableAddress = alignUp(statusAddress + kStatusSize, arena.tableAlignment);
+                    const uint32_t hdBaseAddress = alignUp(addressTableAddress + (kAddressTableEntries * sizeof(uint32_t)), arena.storageAlignment);
+                    const uint32_t sqBaseAddress = alignUp(hdBaseAddress + arena.hdBytes, arena.storageAlignment);
+                    const uint32_t dataBaseAddress = alignUp(sqBaseAddress + arena.sqBytes, arena.storageAlignment);
                     const uint32_t storageEnd = dataBaseAddress + arena.dataBytes;
                     if (storageEnd > arena.limit)
                     {
@@ -313,23 +317,17 @@ namespace ps2x::iop::detail
 
                 if (!m_state.initialized)
                 {
-                    if (!m_host.zeroGuest(m_state.statusAddress, kStatusSize) ||
-                        !m_host.zeroGuest(m_state.addressTableAddress,
-                                          kAddressTableEntries * sizeof(uint32_t)) ||
-                        !m_host.zeroGuest(m_state.storageBaseAddress, m_state.storageSize))
+                    if (!m_host.zeroIopMemory(m_state.statusAddress, kStatusSize) ||
+                        !m_host.zeroIopMemory(m_state.addressTableAddress, kAddressTableEntries * sizeof(uint32_t)) ||
+                        !m_host.zeroIopMemory(m_state.storageBaseAddress, m_state.storageSize))
                     {
                         return false;
                     }
 
-                    if (!writeGuestPod(m_host,
-                                       m_state.addressTableAddress + (0u * sizeof(uint32_t)),
-                                       m_state.hdBaseAddress) ||
-                        !writeGuestPod(m_host,
-                                       m_state.addressTableAddress + (1u * sizeof(uint32_t)),
-                                       m_state.sqBaseAddress) ||
-                        !writeGuestPod(m_host,
-                                       m_state.addressTableAddress + (2u * sizeof(uint32_t)),
-                                       m_state.dataBaseAddress))
+                    if (
+                        !writeIopPod(m_host, m_state.addressTableAddress + (0u * sizeof(uint32_t)), m_state.hdBaseAddress) ||
+                        !writeIopPod(m_host, m_state.addressTableAddress + (1u * sizeof(uint32_t)), m_state.sqBaseAddress) ||
+                        !writeIopPod(m_host, m_state.addressTableAddress + (2u * sizeof(uint32_t)), m_state.dataBaseAddress))
                     {
                         return false;
                     }
@@ -339,9 +337,7 @@ namespace ps2x::iop::detail
                 return true;
             }
 
-            int16_t checkValue(bool seTable,
-                               uint32_t index,
-                               uint32_t count) const
+            int16_t checkValue(bool seTable, uint32_t index, uint32_t count) const
             {
                 if (index >= count)
                 {
@@ -352,10 +348,7 @@ namespace ps2x::iop::detail
                 {
                     const uint32_t base = seTable ? candidate.seAddress : candidate.midiAddress;
                     int16_t value = 0;
-                    if (readGuestPod(m_host,
-                                     base + (index * sizeof(int16_t)),
-                                     value) &&
-                        value != 0)
+                    if (readGuestPod(m_host, base + (index * sizeof(int16_t)), value) && value != 0)
                     {
                         return value;
                     }
@@ -370,19 +363,13 @@ namespace ps2x::iop::detail
                 {
                     std::array<int16_t, 5> seValues{};
                     std::array<int16_t, 4> midiValues{};
-                    const bool seReadable = m_host.readGuest(candidate.seAddress,
-                                                             seValues.data(),
-                                                             sizeof(seValues));
-                    const bool midiReadable = m_host.readGuest(candidate.midiAddress,
-                                                               midiValues.data(),
-                                                               sizeof(midiValues));
+                    const bool seReadable = m_host.readGuest(candidate.seAddress, seValues.data(), sizeof(seValues));
+                    const bool midiReadable = m_host.readGuest(candidate.midiAddress, midiValues.data(), sizeof(midiValues));
                     if (seReadable && midiReadable && !firstReadable)
                     {
                         firstReadable = &candidate;
                     }
-                    const bool looksLive =
-                        (seReadable && hasAnyNonZero(seValues)) ||
-                        (midiReadable && hasAnyNonZero(midiValues));
+                    const bool looksLive = (seReadable && hasAnyNonZero(seValues)) || (midiReadable && hasAnyNonZero(midiValues));
                     if (seReadable && midiReadable && looksLive)
                     {
                         seBase = candidate.seAddress;
@@ -409,35 +396,23 @@ namespace ps2x::iop::detail
                     return;
                 }
 
-                auto backfillSlots = [&](uint32_t statusOffset,
-                                         uint32_t compatBase,
-                                         uint32_t slotCount)
+                auto backfillSlots = [&](uint32_t statusOffset, uint32_t compatBase, uint32_t slotCount)
                 {
                     for (uint32_t slot = 0u; slot < slotCount; ++slot)
                     {
                         int16_t liveValue = 0;
-                        if (!readGuestPod(m_host,
-                                          m_state.statusAddress + statusOffset +
-                                              (slot * sizeof(int16_t)),
-                                          liveValue) ||
-                            liveValue != 0)
+                        if (!readIopPod(m_host, m_state.statusAddress + statusOffset + (slot * sizeof(int16_t)), liveValue) || liveValue != 0)
                         {
                             continue;
                         }
 
                         int16_t compatValue = 0;
-                        if (!readGuestPod(m_host,
-                                          compatBase + (slot * sizeof(int16_t)),
-                                          compatValue) ||
-                            compatValue == 0)
+                        if (!readGuestPod(m_host, compatBase + (slot * sizeof(int16_t)), compatValue) || compatValue == 0)
                         {
                             continue;
                         }
 
-                        (void)writeGuestPod(m_host,
-                                            m_state.statusAddress + statusOffset +
-                                                (slot * sizeof(int16_t)),
-                                            compatValue);
+                        (void)writeIopPod(m_host, m_state.statusAddress + statusOffset + (slot * sizeof(int16_t)), compatValue);
                     }
                 };
 
@@ -458,28 +433,23 @@ namespace ps2x::iop::detail
                 {
                     const uint32_t port = command[1] & 0x0Fu;
                     uint16_t midiInfo = 0u;
-                    (void)readGuestPod(m_host,
-                                       m_state.statusAddress + kMidiInfoOffset,
-                                       midiInfo);
+                    (void)readIopPod(m_host,
+                                     m_state.statusAddress + kMidiInfoOffset,
+                                     midiInfo);
                     midiInfo = static_cast<uint16_t>(midiInfo |
                                                      static_cast<uint16_t>(1u << port));
-                    (void)writeGuestPod(m_host,
-                                        m_state.statusAddress + kMidiInfoOffset,
-                                        midiInfo);
+                    (void)writeIopPod(m_host,
+                                      m_state.statusAddress + kMidiInfoOffset,
+                                      midiInfo);
                     break;
                 }
                 case 0x21u: // SdrBgmStop
                 {
                     const uint32_t port = command[1] & 0x0Fu;
                     uint16_t midiInfo = 0u;
-                    (void)readGuestPod(m_host,
-                                       m_state.statusAddress + kMidiInfoOffset,
-                                       midiInfo);
-                    midiInfo = static_cast<uint16_t>(midiInfo &
-                                                     ~static_cast<uint16_t>(1u << port));
-                    (void)writeGuestPod(m_host,
-                                        m_state.statusAddress + kMidiInfoOffset,
-                                        midiInfo);
+                    (void)readIopPod(m_host, m_state.statusAddress + kMidiInfoOffset, midiInfo);
+                    midiInfo = static_cast<uint16_t>(midiInfo & ~static_cast<uint16_t>(1u << port));
+                    (void)writeIopPod(m_host, m_state.statusAddress + kMidiInfoOffset, midiInfo);
                     break;
                 }
                 case 0x28u: // SdrHDDataSet
@@ -490,10 +460,7 @@ namespace ps2x::iop::detail
                         break;
                     }
                     const int16_t checksum = checkValue(false, port, 4u);
-                    (void)writeGuestPod(m_host,
-                                        m_state.statusAddress + kMidiSumOffset +
-                                            (port * sizeof(int16_t)),
-                                        checksum);
+                    (void)writeIopPod(m_host, m_state.statusAddress + kMidiSumOffset + (port * sizeof(int16_t)), checksum);
                     break;
                 }
                 case 0x29u: // SdrHDDataSet2
@@ -504,15 +471,11 @@ namespace ps2x::iop::detail
                         break;
                     }
                     const int16_t checksum = checkValue(true, port, 5u);
-                    (void)writeGuestPod(m_host,
-                                        m_state.statusAddress + kSeSumOffset +
-                                            (port * sizeof(int16_t)),
-                                        checksum);
+                    (void)writeIopPod(m_host, m_state.statusAddress + kSeSumOffset + (port * sizeof(int16_t)), checksum);
                     break;
                 }
                 case 0x10u: // SdrSeAllStop
-                    (void)m_host.zeroGuest(m_state.statusAddress + kSeInfoOffset,
-                                           6u * sizeof(uint16_t));
+                    (void)m_host.zeroIopMemory(m_state.statusAddress + kSeInfoOffset, 6u * sizeof(uint16_t));
                     break;
                 default:
                     break;
@@ -569,12 +532,13 @@ namespace ps2x::iop::detail
     std::unique_ptr<IopService> createTsnddrvService(IopHost &host,
                                                      TsnddrvBindings bindings)
     {
-        const auto isPowerOfTwo = [](uint32_t value) {
+        const auto isPowerOfTwo = [](uint32_t value)
+        {
             return value != 0u && (value & (value - 1u)) == 0u;
         };
-        const auto alignUp64 = [](uint64_t value, uint32_t alignment) {
-            return (value + (alignment - 1u)) &
-                   ~static_cast<uint64_t>(alignment - 1u);
+        const auto alignUp64 = [](uint64_t value, uint32_t alignment)
+        {
+            return (value + (alignment - 1u)) & ~static_cast<uint64_t>(alignment - 1u);
         };
 
         const TsnddrvGuestArena &arena = bindings.arena;
@@ -590,8 +554,7 @@ namespace ps2x::iop::detail
         }
 
         uint64_t end = alignUp64(arena.base, arena.statusAlignment) + kStatusSize;
-        end = alignUp64(end, arena.tableAlignment) +
-              (kAddressTableEntries * sizeof(uint32_t));
+        end = alignUp64(end, arena.tableAlignment) + (kAddressTableEntries * sizeof(uint32_t));
         end = alignUp64(end, arena.storageAlignment) + arena.hdBytes;
         end = alignUp64(end, arena.storageAlignment) + arena.sqBytes;
         end = alignUp64(end, arena.storageAlignment) + arena.dataBytes;

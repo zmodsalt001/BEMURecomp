@@ -1,12 +1,13 @@
 #include "iop_rpc.h"
 
-#include "iop_cpu.h"
-#include "iop_kernel.h"
-#include "iop_memory.h"
+#include "../core/iop_cpu.h"
+#include "../core/iop_kernel.h"
+#include "../core/iop_memory.h"
 #include "ps2x/iop/iop_host.h"
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -119,8 +120,6 @@ namespace ps2x::iop::detail
             return true;
         }
         case 8: // sceSifDmaStat
-            // Transfers are applied synchronously above. The IOP API reports
-            // a negative value once the transaction is no longer active.
             setV0(0xFFFFFFFFu);
             return true;
         case 29: // sceSifCheckInit
@@ -148,13 +147,67 @@ namespace ps2x::iop::detail
         case 9:
         case 10:
         case 11:
-        case 12:
-        case 13:
         case 14: // InitRpc
         case 15:
         case 16:
             setV0(0);
             return true;
+        case 12: // sceSifSendCmd
+        case 13: // isceSifSendCmd
+        {
+            constexpr uint32_t kHeaderSize = 16u;
+            constexpr uint32_t kMaxPacketSize = 112u;
+            const uint32_t commandId = cpu.gpr[4];
+            const uint32_t packetAddress = cpu.gpr[5];
+            const uint32_t packetSize = cpu.gpr[6];
+            const uint32_t extraSource = cpu.gpr[7];
+            const uint32_t stackPointer = cpu.gpr[29];
+            const uint32_t extraDestination = m_memory.read32(stackPointer + 16u);
+            const int32_t signedExtraSize = static_cast<int32_t>(m_memory.read32(stackPointer + 20u));
+
+            if (packetAddress == 0u || packetSize < kHeaderSize || packetSize > kMaxPacketSize ||
+                !m_memory.ownsRamRange(packetAddress, packetSize))
+            {
+                setV0(0u);
+                return true;
+            }
+
+            std::array<uint8_t, kMaxPacketSize> packet{};
+            if (!m_memory.readRam(packetAddress, packet.data(), packetSize))
+            {
+                setV0(0u);
+                return true;
+            }
+
+            uint32_t extraSize = 0u;
+            if (signedExtraSize > 0)
+            {
+                extraSize = static_cast<uint32_t>(signedExtraSize);
+                if (extraSource == 0u || extraDestination == 0u ||
+                    !m_memory.ownsRamRange(extraSource, extraSize) ||
+                    !m_host.writeGuest(extraDestination, m_memory.ram().data() + IopMemory::physicalAddress(extraSource), extraSize))
+                {
+                    setV0(0u);
+                    return true;
+                }
+            }
+
+            const uint32_t sizeWord = packetSize | (extraSize << 8u);
+            std::memcpy(packet.data() + 0u, &sizeWord, sizeof(sizeWord));
+            std::memcpy(packet.data() + 4u, &extraDestination, sizeof(extraDestination));
+            std::memcpy(packet.data() + 8u, &commandId, sizeof(commandId));
+
+            if (!m_host.sendSifCommand(commandId, packet.data(), packetSize))
+            {
+                // A command without an EE handler is still a completed DMA on  real hardware. Only malformed packets fail above.
+            }
+
+            const uint32_t dmaId = m_nextDmaId++;
+            if (m_nextDmaId == 0u || m_nextDmaId > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()))
+                m_nextDmaId = 1u;
+            setV0(dmaId);
+            return true;
+        }
         case 17: // sceSifRegisterRpc
         {
             RpcServer server;
@@ -255,8 +308,7 @@ namespace ps2x::iop::detail
                 const uint32_t copySize = std::min<uint32_t>(request.receive.size, IopMemory::RamSize - physical);
                 (void)m_host.writeGuest(request.receive.address, m_memory.ram().data() + physical, copySize);
                 if (copySize < request.receive.size)
-                    (void)m_host.zeroGuest(request.receive.address + copySize,
-                                           request.receive.size - copySize);
+                    (void)m_host.zeroGuest(request.receive.address + copySize, request.receive.size - copySize);
             }
         }
 
@@ -270,39 +322,11 @@ namespace ps2x::iop::detail
 
     void IopRpcBridge::onSifTransfer(const SifTransfer &transfer)
     {
-        if (transfer.size == 0u)
-            return;
-
-        if (transfer.kind == SifTransferKind::SetDma)
-        {
-            // sceSifSetDma transfers EE memory to IOP RAM. The runtime performs its
-            // legacy EE-side mirror first, then gives the physical emulator the same
-            // payload so the IOP observes it at the requested destination.
-            if (transfer.phase != SifTransferPhase::AfterCopy)
-                return;
-            const uint32_t destination = IopMemory::physicalAddress(transfer.destinationAddress);
-            if (destination >= IopMemory::RamSize)
-                return;
-            const size_t copySize = std::min<size_t>(transfer.size, IopMemory::RamSize - destination);
-            std::vector<uint8_t> data(copySize);
-            if (m_host.readGuest(transfer.sourceAddress, data.data(), data.size()))
-                (void)m_memory.writeRam(destination, data.data(), data.size());
-            return;
-        }
-
-        if (transfer.kind == SifTransferKind::GetOtherData && transfer.phase == SifTransferPhase::BeforeCopy)
-        {
-            // sceSifGetOtherData is the reverse direction: its source is an IOP
-            // address and its destination is in EE memory. Stage the physical IOP
-            // bytes at the source's EE mirror before the runtime performs the copy.
-            const uint32_t source = IopMemory::physicalAddress(transfer.sourceAddress);
-            if (source >= IopMemory::RamSize)
-                return;
-            const size_t copySize = std::min<size_t>(transfer.size, IopMemory::RamSize - source);
-            if (!m_memory.ownsRamRange(source, copySize))
-                return;
-            (void)m_host.writeGuest(transfer.sourceAddress, m_memory.ram().data() + source, copySize);
-        }
+        // The EE SIF transport owns the actual directional memory movement.
+        // Services still receive both phases through IopSubsystem, but mirroring
+        // IOP bytes through an equal-numbered EE address would alias two distinct
+        // PS2 address spaces and can overwrite live game data.
+        (void)transfer;
     }
 
     void IopRpcBridge::removeServersInRange(uint32_t base, uint32_t size)

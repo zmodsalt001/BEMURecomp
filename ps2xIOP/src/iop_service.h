@@ -18,6 +18,13 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] virtual std::string_view name() const = 0;
         [[nodiscard]] virtual std::span<const uint32_t> sids() const = 0;
+        // A service with aliases is dormant until one of these IOP modules is
+        // actually loaded. Profile services can omit aliases when the profile
+        // itself is the explicit compatibility contract.
+        [[nodiscard]] virtual std::span<const std::string_view> moduleAliases() const
+        {
+            return {};
+        }
         virtual void reset() = 0;
 
         [[nodiscard]] virtual RpcAbi selectRpcAbi(const RpcAbiRequest &request) const

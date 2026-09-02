@@ -84,6 +84,7 @@ namespace ps2x::iop::detail
         }
         if ((phys & 3u) == 0u && isHardwareAddress(phys))
             return readHardware32(phys);
+
         return static_cast<uint32_t>(read8(address)) |
                (static_cast<uint32_t>(read8(address + 1u)) << 8u) |
                (static_cast<uint32_t>(read8(address + 2u)) << 16u) |

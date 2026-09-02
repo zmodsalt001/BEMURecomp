@@ -1,8 +1,10 @@
 #include "ps2x/iop/iop_subsystem.h"
 
 #include "iop_service.h"
+#include "iop_module_manager.h"
 #include "emulator/iop_emulator.h"
 #include "plugin_loader.h"
+#include "ps2x/iop/ps2_path.h"
 
 #include <algorithm>
 #include <cctype>
@@ -69,9 +71,37 @@ namespace ps2x::iop
     {
     public:
         explicit Impl(IopHost &hostRef)
-            : host(hostRef), pluginCatalog(hostRef), coreServices(detail::createCoreServices(hostRef)), profiles(detail::createBuiltinProfiles()), emulator(hostRef)
+            : host(hostRef),
+              pluginCatalog(hostRef),
+              coreServices(detail::createCoreServices(hostRef)),
+              profiles(detail::createBuiltinProfiles()),
+              emulator(hostRef)
         {
+            refreshServiceModuleKeys();
             rebuildRoutes();
+        }
+
+        bool serviceActive(const detail::IopService &service) const
+        {
+            return moduleManager.isLoaded(service.moduleAliases());
+        }
+
+        void refreshServiceModuleKeys()
+        {
+            std::vector<std::string> keys;
+            auto collect = [&](const detail::ServiceList &services)
+            {
+                for (const auto &service : services)
+                {
+                    if (!service)
+                        continue;
+                    for (std::string_view alias : service->moduleAliases())
+                        keys.emplace_back(alias);
+                }
+            };
+            collect(coreServices);
+            collect(profileServices);
+            moduleManager.setServiceModuleKeys(std::move(keys));
         }
 
         void rebuildRoutes()
@@ -82,7 +112,7 @@ namespace ps2x::iop
                 std::unordered_map<uint32_t, detail::IopService *> layer;
                 for (const auto &service : services)
                 {
-                    if (!service)
+                    if (!service || !serviceActive(*service))
                     {
                         continue;
                     }
@@ -119,6 +149,7 @@ namespace ps2x::iop
         std::string activeProvider;
         std::string lastError;
         bool routesValid = true;
+        detail::IopModuleManager moduleManager;
         detail::IopEmulator emulator;
     };
 
@@ -180,6 +211,7 @@ namespace ps2x::iop
             {
                 *error = m_impl->lastError;
             }
+            m_impl->refreshServiceModuleKeys();
             m_impl->rebuildRoutes();
             return false;
         }
@@ -199,6 +231,7 @@ namespace ps2x::iop
                 {
                     *error = m_impl->lastError;
                 }
+                m_impl->refreshServiceModuleKeys();
                 m_impl->rebuildRoutes();
                 return false;
             }
@@ -209,11 +242,13 @@ namespace ps2x::iop
                 {
                     *error = m_impl->lastError;
                 }
+                m_impl->refreshServiceModuleKeys();
                 m_impl->rebuildRoutes();
                 return false;
             }
         }
 
+        m_impl->refreshServiceModuleKeys();
         m_impl->rebuildRoutes();
         if (!m_impl->routesValid)
         {
@@ -221,6 +256,7 @@ namespace ps2x::iop
             m_impl->profileServices.clear();
             m_impl->activeProfile.clear();
             m_impl->activeProvider.clear();
+            m_impl->refreshServiceModuleKeys();
             m_impl->rebuildRoutes();
             m_impl->lastError = routeError;
             if (error)
@@ -236,6 +272,7 @@ namespace ps2x::iop
 
     void IopSubsystem::reset()
     {
+        m_impl->moduleManager.reset();
         for (auto &service : m_impl->coreServices)
         {
             if (service)
@@ -251,11 +288,31 @@ namespace ps2x::iop
             }
         }
         m_impl->emulator.reset();
+        m_impl->refreshServiceModuleKeys();
+        m_impl->rebuildRoutes();
     }
 
     ModuleLoadResult IopSubsystem::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
     {
-        return m_impl->emulator.loadModule(path, arguments, argumentSize);
+        const ParsedPs2Path parsed = parsePs2Path(path);
+        if (!parsed)
+            return {true, -1, -1};
+
+        if (parsed.device != Ps2PathDevice::Rom0)
+        {
+            ModuleLoadResult physical = m_impl->emulator.loadModule(path, arguments, argumentSize);
+            if (physical.moduleId > 0)
+            {
+                m_impl->moduleManager.observePhysicalLoad(physical.moduleId, path);
+                m_impl->rebuildRoutes();
+                return physical;
+            }
+        }
+
+        ModuleLoadResult hle = m_impl->moduleManager.loadHle(path);
+        if (hle.moduleId > 0)
+            m_impl->rebuildRoutes();
+        return hle;
     }
 
     ModuleLoadResult IopSubsystem::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
@@ -265,7 +322,16 @@ namespace ps2x::iop
 
     bool IopSubsystem::stopModule(int32_t moduleId, int32_t *result)
     {
-        return m_impl->emulator.stopModule(moduleId, result);
+        if (m_impl->moduleManager.stopHle(moduleId, result))
+        {
+            m_impl->rebuildRoutes();
+            return true;
+        }
+        if (!m_impl->emulator.stopModule(moduleId, result))
+            return false;
+        m_impl->moduleManager.observePhysicalStop(moduleId);
+        m_impl->rebuildRoutes();
+        return true;
     }
 
     void IopSubsystem::runEeCycles(uint64_t eeCycles) noexcept
@@ -277,7 +343,7 @@ namespace ps2x::iop
     {
         for (const auto &service : m_impl->profileServices)
         {
-            if (service)
+            if (service && m_impl->serviceActive(*service))
             {
                 const RpcAbi selected = service->selectRpcAbi(request);
                 if (selected != RpcAbi::RuntimeDefault)
@@ -288,7 +354,7 @@ namespace ps2x::iop
         }
         for (const auto &service : m_impl->coreServices)
         {
-            if (service)
+            if (service && m_impl->serviceActive(*service))
             {
                 const RpcAbi selected = service->selectRpcAbi(request);
                 if (selected != RpcAbi::RuntimeDefault)
@@ -341,19 +407,49 @@ namespace ps2x::iop
     {
         for (auto &service : m_impl->coreServices)
         {
-            if (service)
+            if (service && m_impl->serviceActive(*service))
             {
                 service->onSifTransfer(transfer);
             }
         }
         for (auto &service : m_impl->profileServices)
         {
-            if (service)
+            if (service && m_impl->serviceActive(*service))
             {
                 service->onSifTransfer(transfer);
             }
         }
         m_impl->emulator.onSifTransfer(transfer);
+    }
+
+    uint32_t IopSubsystem::allocateMemory(uint32_t size, uint32_t alignment)
+    {
+        return m_impl->emulator.allocateMemory(size, alignment);
+    }
+
+    bool IopSubsystem::freeMemory(uint32_t address)
+    {
+        return m_impl->emulator.freeMemory(address);
+    }
+
+    bool IopSubsystem::readMemory(uint32_t address, void *destination, size_t size) const
+    {
+        return m_impl->emulator.readMemory(address, destination, size);
+    }
+
+    bool IopSubsystem::writeMemory(uint32_t address, const void *source, size_t size)
+    {
+        return m_impl->emulator.writeMemory(address, source, size);
+    }
+
+    bool IopSubsystem::zeroMemory(uint32_t address, size_t size)
+    {
+        return m_impl->emulator.zeroMemory(address, size);
+    }
+
+    bool IopSubsystem::isMemoryRange(uint32_t address, size_t size) const
+    {
+        return m_impl->emulator.isMemoryRange(address, size);
     }
 
     DebugSnapshot IopSubsystem::debugSnapshot() const
@@ -384,6 +480,7 @@ namespace ps2x::iop
                 row.name = service->name();
                 row.sids.assign(service->sids().begin(), service->sids().end());
                 row.profileSpecific = profileSpecific;
+                row.active = m_impl->serviceActive(*service);
                 service->appendDebugMetrics(row.metrics);
                 snapshot.services.push_back(std::move(row));
             }

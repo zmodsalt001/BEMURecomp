@@ -38,6 +38,14 @@ namespace ps2x::iop
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
         void onSifTransfer(const SifTransfer &transfer);
 
+        // Physical IOP RAM access shared by the emulator, SIF DMA, and HLE services. Addresses are IOP addresses.
+        [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);
+        [[nodiscard]] bool freeMemory(uint32_t address);
+        [[nodiscard]] bool readMemory(uint32_t address, void *destination, size_t size) const;
+        [[nodiscard]] bool writeMemory(uint32_t address, const void *source, size_t size);
+        [[nodiscard]] bool zeroMemory(uint32_t address, size_t size);
+        [[nodiscard]] bool isMemoryRange(uint32_t address, size_t size) const;
+
         [[nodiscard]] DebugSnapshot debugSnapshot() const;
 
     private:

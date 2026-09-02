@@ -1,8 +1,10 @@
 #include "iop_cdvd.h"
 
-#include "iop_cpu.h"
-#include "iop_memory.h"
+#include "../core/iop_cpu.h"
+#include "../core/iop_kernel.h"
+#include "../core/iop_memory.h"
 #include "ps2x/iop/iop_host.h"
+#include "ps2x/iop/ps2_path.h"
 
 #include <algorithm>
 #include <array>
@@ -32,6 +34,11 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCdvdInitExit = 5u;
         constexpr uint32_t kCdvdCallbackRead = 1u;
         constexpr uint32_t kCdvdCallbackSeek = 4u;
+        constexpr uint32_t kCdvdInterruptReadyBits = 0x29u;
+        constexpr uint32_t kEventFlagMulti = 2u;
+        constexpr uint32_t kCdvdStreamTimeout = 5000u;
+        constexpr uint32_t kCdvdSyncTimeout = 15000u;
+        constexpr uint32_t kCdvdmanVersion = 0x0226u;
 
         uint32_t alignSectors(uint64_t bytes)
         {
@@ -109,6 +116,23 @@ namespace ps2x::iop::detail
             return static_cast<uint32_t>(std::max<uint64_t>(kSectorSize, alignSectors(cursor) * kSectorSize));
         }
 
+        std::string normalizedIsoComponent(std::string_view value)
+        {
+            std::string result(value);
+            const size_t semicolon = result.rfind(';');
+            if (semicolon != std::string::npos && semicolon + 1u < result.size() &&
+                std::all_of(result.begin() + static_cast<std::ptrdiff_t>(semicolon + 1u), result.end(),
+                            [](unsigned char ch)
+                            { return std::isdigit(ch) != 0; }))
+            {
+                result.resize(semicolon);
+            }
+            std::transform(result.begin(), result.end(), result.begin(),
+                           [](unsigned char ch)
+                           { return static_cast<char>(std::toupper(ch)); });
+            return result;
+        }
+
         size_t writeDirectoryRecord(uint8_t *destination,
                                     uint32_t lsn,
                                     uint32_t size,
@@ -151,8 +175,8 @@ namespace ps2x::iop::detail
             std::vector<size_t> children;
         };
 
-        Impl(IopHost &hostRef, IopMemory &memoryRef)
-            : host(hostRef), memory(memoryRef)
+        Impl(IopHost &hostRef, IopMemory &memoryRef, IopKernel &kernelRef)
+            : host(hostRef), memory(memoryRef), kernel(kernelRef)
         {
         }
 
@@ -169,6 +193,9 @@ namespace ps2x::iop::detail
             mediaMode = 0u;
             currentLsn = 0u;
             lastError = kCdvdErrorNone;
+            streamFlag = 0u;
+            lastReadTimeout = 0u;
+            interruptEventFlagId = 0;
             virtualIsoBuilt = false;
             virtualIsoValid = false;
             completionCallback.reset();
@@ -203,6 +230,7 @@ namespace ps2x::iop::detail
             case 6: // sceCdRead
                 if (readSectors(a0, a1, a2))
                 {
+                    signalCommandComplete();
                     if (callback.address != 0u)
                     {
                         completionCallback = CompletionCallback{
@@ -220,6 +248,7 @@ namespace ps2x::iop::detail
             case 7: // sceCdSeek
                 currentLsn = a0;
                 lastError = kCdvdErrorNone;
+                signalCommandComplete();
                 if (callback.address != 0u)
                 {
                     completionCallback = CompletionCallback{
@@ -233,6 +262,10 @@ namespace ps2x::iop::detail
 
             case 8: // sceCdGetError
                 cpu.gpr[2] = lastError;
+                return true;
+
+            case 10: // sceCdSearchFile
+                cpu.gpr[2] = searchFile(a0, a1) ? 1u : 0u;
                 return true;
 
             case 11: // sceCdSync
@@ -259,6 +292,52 @@ namespace ps2x::iop::detail
                 return true;
             }
 
+            case 50: // sceCdSC
+            {
+                const int32_t code = static_cast<int32_t>(a0);
+                switch (code)
+                {
+                case -23: // Translate a logical sector for a dual-layer disc.
+                    // The host image exposes one continuous LSN space, so no layer offset is required.
+                    cpu.gpr[2] = a1 != 0u ? memory.read32(a1) : 0u;
+                    return true;
+                case -18:
+                    lastReadTimeout = a1 != 0u ? memory.read32(a1) : 0u;
+                    cpu.gpr[2] = 0u;
+                    return true;
+                case -17:
+                    cpu.gpr[2] = kCdvdStreamTimeout;
+                    return true;
+                case -15:
+                    cpu.gpr[2] = kCdvdSyncTimeout;
+                    return true;
+                case -11:
+                    cpu.gpr[2] = static_cast<uint32_t>(ensureInterruptEventFlag());
+                    return true;
+                case -9:
+                    cpu.gpr[2] = kCdvdmanVersion;
+                    return true;
+                case -2:
+                    lastError = a1 != 0u ? memory.read8(a1) : kCdvdErrorNone;
+                    cpu.gpr[2] = lastError;
+                    return true;
+                case -1:
+                case 0:
+                case 1:
+                case 2:
+                    if (a1 != 0u)
+                        memory.write32(a1, lastError & 0xFFu);
+                    if (code != -1)
+                        streamFlag = static_cast<uint32_t>(code);
+                    cpu.gpr[2] = streamFlag;
+                    return true;
+                default:
+                    // sceCdSC is intentionally extensible; unsupported controls are no-ops in cdvdman.
+                    cpu.gpr[2] = 0u;
+                    return true;
+                }
+            }
+
             case 75: // sceCdMmode
                 mediaMode = a0;
                 cpu.gpr[2] = 1u;
@@ -277,6 +356,22 @@ namespace ps2x::iop::detail
         }
 
     private:
+        int ensureInterruptEventFlag()
+        {
+            if (interruptEventFlagId == 0)
+            {
+                interruptEventFlagId = kernel.createInternalEventFlag(
+                    kEventFlagMulti, 0u, kCdvdInterruptReadyBits);
+            }
+            return interruptEventFlagId;
+        }
+
+        void signalCommandComplete()
+        {
+            if (interruptEventFlagId != 0)
+                (void)kernel.setInternalEventFlag(interruptEventFlagId, kCdvdInterruptReadyBits);
+        }
+
         void closeFiles()
         {
             if (imageHandle != 0u)
@@ -463,6 +558,62 @@ namespace ps2x::iop::detail
             return true;
         }
 
+        IsoNode *findVirtualIsoNode(std::string_view guestPath)
+        {
+            if (!buildVirtualIso())
+                return nullptr;
+
+            const ParsedPs2Path parsed = parsePs2Path(guestPath);
+            if (!parsed || parsed.device != Ps2PathDevice::Cdrom)
+                return nullptr;
+
+            size_t current = 0u;
+            size_t begin = 0u;
+            while (begin <= parsed.path.size())
+            {
+                const size_t end = parsed.path.find('/', begin);
+                const size_t length = (end == std::string::npos) ? parsed.path.size() - begin : end - begin;
+                const std::string_view component(parsed.path.data() + begin, length);
+                begin = (end == std::string::npos) ? parsed.path.size() + 1u : end + 1u;
+
+                if (component.empty() || component == ".")
+                    continue;
+                if (component == "..")
+                    return nullptr;
+
+                const std::string wanted = normalizedIsoComponent(component);
+                const auto child = std::find_if(nodes[current].children.begin(), nodes[current].children.end(),
+                                                [&](size_t childIndex)
+                                                {
+                                                    return normalizedIsoComponent(nodes[childIndex].identifier) == wanted;
+                                                });
+                if (child == nodes[current].children.end())
+                    return nullptr;
+                current = *child;
+            }
+            return &nodes[current];
+        }
+
+        bool searchFile(uint32_t resultAddress, uint32_t nameAddress)
+        {
+            if (resultAddress == 0u || nameAddress == 0u)
+                return false;
+
+            const std::string guestPath = memory.readString(nameAddress, 1024u);
+            IsoNode *node = findVirtualIsoNode(guestPath);
+            if (!node)
+                return false;
+
+            // sceCdlFILE: lsn, size, name[16], date/flags[8].
+            std::array<uint8_t, 32u> result{};
+            writeLe32(result.data(), node->lsn);
+            writeLe32(result.data() + 4u, node->size);
+            const std::string leaf = normalizedIsoComponent(node->identifier);
+            std::memcpy(result.data() + 8u, leaf.data(), std::min<size_t>(16u, leaf.size()));
+            result[24u] = node->directory ? 2u : 0u;
+            return memory.writeRam(resultAddress, result.data(), result.size());
+        }
+
         IsoNode *fileForSector(uint32_t lsn)
         {
             for (IsoNode &node : nodes)
@@ -558,12 +709,16 @@ namespace ps2x::iop::detail
 
         IopHost &host;
         IopMemory &memory;
+        IopKernel &kernel;
         Callback callback;
         std::optional<CompletionCallback> completionCallback;
         bool initialized = false;
         uint32_t mediaMode = 0u;
         uint32_t currentLsn = 0u;
         uint32_t lastError = kCdvdErrorNone;
+        uint32_t streamFlag = 0u;
+        uint32_t lastReadTimeout = 0u;
+        int interruptEventFlagId = 0;
         uint64_t imageHandle = 0u;
         bool virtualIsoBuilt = false;
         bool virtualIsoValid = false;
@@ -572,8 +727,8 @@ namespace ps2x::iop::detail
         std::unordered_map<uint32_t, std::array<uint8_t, kSectorSize>> metadataSectors;
     };
 
-    IopCdvd::IopCdvd(IopHost &host, IopMemory &memory)
-        : m_impl(std::make_unique<Impl>(host, memory))
+    IopCdvd::IopCdvd(IopHost &host, IopMemory &memory, IopKernel &kernel)
+        : m_impl(std::make_unique<Impl>(host, memory, kernel))
     {
     }
 

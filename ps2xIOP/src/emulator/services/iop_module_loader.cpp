@@ -1,6 +1,6 @@
 #include "iop_module_loader.h"
 
-#include "iop_memory.h"
+#include "../core/iop_memory.h"
 #include "ps2x/iop/iop_subsystem.h"
 
 #include <algorithm>
@@ -170,9 +170,7 @@ namespace ps2x::iop::detail
                 if (relsec.link < sections.size())
                 {
                     const Elf32Shdr &symsec = sections[relsec.link];
-                    if (symsec.type == SHT_SYMTAB &&
-                        symsec.entsize >= sizeof(Elf32Sym) &&
-                        checkedRange(image.size(), symsec.offset, symsec.size))
+                    if (symsec.type == SHT_SYMTAB && symsec.entsize >= sizeof(Elf32Sym) && checkedRange(image.size(), symsec.offset, symsec.size))
                     {
                         const size_t count = symsec.size / symsec.entsize;
                         symbolStorage.resize(count);
@@ -198,9 +196,7 @@ namespace ps2x::iop::detail
                     if (relsec.type == SHT_RELA)
                     {
                         Elf32Rela relocation{};
-                        std::memcpy(&relocation,
-                                    image.data() + relsec.offset + offset,
-                                    sizeof(relocation));
+                        std::memcpy(&relocation, image.data() + relsec.offset + offset, sizeof(relocation));
                         relocationOffset = relocation.offset;
                         relocationInfo = relocation.info;
                         explicitAddend = relocation.addend;
@@ -224,8 +220,7 @@ namespace ps2x::iop::detail
                             symbolValue = symbol.value;
                             if (symbol.shndx != 0u)
                             {
-                                symbolValue = static_cast<uint32_t>(
-                                    static_cast<int64_t>(symbolValue) + delta);
+                                symbolValue = static_cast<uint32_t>(static_cast<int64_t>(symbolValue) + delta);
                             }
                         }
                     }
@@ -258,16 +253,12 @@ namespace ps2x::iop::detail
                         break;
                     case R_MIPS_32:
                     case R_MIPS_REL32:
-                        memory.write32(place,
-                                       static_cast<uint32_t>(
-                                           static_cast<int64_t>(addend) + symbolValue));
+                        memory.write32(place, static_cast<uint32_t>(static_cast<int64_t>(addend) + symbolValue));
                         break;
                     case R_MIPS_26:
                     {
                         const uint32_t target = ((word & 0x03FFFFFFu) << 2u) + symbolValue;
-                        memory.write32(place,
-                                       (word & 0xFC000000u) |
-                                           ((target >> 2u) & 0x03FFFFFFu));
+                        memory.write32(place, (word & 0xFC000000u) | ((target >> 2u) & 0x03FFFFFFu));
                         break;
                     }
                     case R_MIPS_HI16:
@@ -501,9 +492,7 @@ namespace ps2x::iop::detail
                 else
                 {
                     if (!checkedRange(image.size(), section.offset, section.size) ||
-                        !memory.writeRam(destination,
-                                         image.data() + section.offset,
-                                         section.size))
+                        !memory.writeRam(destination, image.data() + section.offset, section.size))
                         return result;
                 }
             }

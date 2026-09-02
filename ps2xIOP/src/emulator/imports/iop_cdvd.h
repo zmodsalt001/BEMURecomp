@@ -12,6 +12,7 @@ namespace ps2x::iop
 namespace ps2x::iop::detail
 {
     struct IopCpuState;
+    class IopKernel;
     class IopMemory;
 
     class IopCdvd
@@ -24,7 +25,7 @@ namespace ps2x::iop::detail
             uint32_t reason = 0u;
         };
 
-        IopCdvd(IopHost &host, IopMemory &memory);
+        IopCdvd(IopHost &host, IopMemory &memory, IopKernel &kernel);
         ~IopCdvd();
 
         IopCdvd(const IopCdvd &) = delete;

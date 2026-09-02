@@ -1,12 +1,20 @@
 #include "iop_emulator.h"
-#include "iop_cdvd.h"
-#include "iop_cpu.h"
-#include "iop_imports.h"
-#include "iop_kernel.h"
-#include "iop_memory.h"
-#include "iop_module_loader.h"
-#include "iop_rpc.h"
-#include "iop_sysclib.h"
+#include "imports/iop_cdvd.h"
+#include "core/iop_cpu.h"
+#include "imports/iop_heaplib.h"
+#include "imports/iop_imports.h"
+#include "imports/iop_intrman.h"
+#include "imports/iop_ioman.h"
+#include "core/iop_kernel.h"
+#include "imports/iop_loadcore.h"
+#include "core/iop_memory.h"
+#include "services/iop_module_loader.h"
+#include "services/iop_rpc.h"
+#include "imports/iop_stdio.h"
+#include "imports/iop_sysclib.h"
+#include "imports/iop_sysmem.h"
+#include "imports/iop_timrman.h"
+#include "imports/iop_vblank.h"
 #include "iop_emulator_const.h"
 
 #include <algorithm>
@@ -15,7 +23,6 @@
 #include <optional>
 #include <span>
 #include <sstream>
-#include <unordered_map>
 #include <utility>
 
 namespace ps2x::iop::detail
@@ -73,13 +80,6 @@ namespace ps2x::iop::detail
             bool resident = false;
         };
 
-        struct InterruptHandler
-        {
-            uint32_t function = 0;
-            uint32_t argument = 0;
-            uint32_t gp = 0;
-        };
-
         struct GuestCallback
         {
             uint32_t function = 0;
@@ -93,21 +93,22 @@ namespace ps2x::iop::detail
             uint32_t argument = 0u;
         };
 
-        struct IomanDevice
-        {
-            uint32_t address = 0;
-            uint32_t gp = 0;
-            std::string name;
-        };
-
         explicit Impl(IopHost &hostRef)
             : host(hostRef),
-              cdvd(host, memory),
+              sysmem(host, memory),
               kernel(memory),
+              cdvd(host, memory, kernel),
+              vblank(kernel),
               rpc(host, memory, kernel),
               sysclib(memory),
+              stdio(host, memory),
+              heaplib(memory),
+              intrman(memory),
+              timrman(),
+              ioman(memory),
               cpuCore(memory),
-              imports(memory)
+              imports(memory),
+              loadcore(memory, imports)
         {
             reset();
         }
@@ -120,9 +121,9 @@ namespace ps2x::iop::detail
             imports.reset();
             rpc.reset();
             cdvd.reset();
-            interruptHandlers.clear();
-            iomanDevices.clear();
-            interruptEnabled.clear();
+            intrman.reset();
+            timrman.reset();
+            ioman.reset();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
             nextModuleId = 1;
@@ -209,16 +210,6 @@ namespace ps2x::iop::detail
             return memory.freeAllocation(address);
         }
 
-        uint32_t maxFreeMemory() const
-        {
-            return memory.maxFreeMemory();
-        }
-
-        std::string readString(uint32_t address, size_t limit = 1024) const
-        {
-            return memory.readString(address, limit);
-        }
-
         void log(LogLevel level, std::string_view text)
         {
             host.log(level, text);
@@ -249,77 +240,15 @@ namespace ps2x::iop::detail
         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
         {
             const uint32_t a0 = cpu.gpr[4];
-            const uint32_t a1 = cpu.gpr[5];
-            const uint32_t a2 = cpu.gpr[6];
-            const uint32_t a3 = cpu.gpr[7];
             auto setV0 = [&](uint32_t value)
             {
                 cpu.gpr[2] = value;
             };
 
-            // TODO this will become a dispatch table once we have more imports implemented, but for now this is fine.
-            if (iequals(call.library, "sysmem"))
-            {
-                switch (call.ordinal)
-                {
-                case 4:
-                {
-                    const uint32_t mode = a0;
-                    const uint32_t size = a1;
-                    const uint32_t ptr = a2;
-                    const uint32_t address = mode == 2u ? allocate(size, 16u, ptr) : allocate(size, 16u);
-                    setV0(address);
-                    return ImportDisposition::Handled;
-                }
-                case 5:
-                    setV0(freeAllocation(a0) ? 0u : 0xFFFFFFFFu);
-                    return ImportDisposition::Handled;
-                case 6:
-                    setV0(kRamSize);
-                    return ImportDisposition::Handled;
-                case 7:
-                    setV0(maxFreeMemory());
-                    return ImportDisposition::Handled;
-                case 8:
-                    setV0(maxFreeMemory());
-                    return ImportDisposition::Handled;
-                case 9:
-                {
-                    if (const auto block = memory.allocationContaining(a0))
-                    {
-                        setV0(block->address);
-                        return ImportDisposition::Handled;
-                    }
-                    setV0(0u);
-                    return ImportDisposition::Handled;
-                }
-                case 10:
-                {
-                    if (const auto block = memory.allocationContaining(a0))
-                    {
-                        setV0(block->size);
-                        return ImportDisposition::Handled;
-                    }
-                    setV0(0xFFFFFFFFu);
-                    return ImportDisposition::Handled;
-                }
-                case 14:
-                {
-                    const std::string format = readString(a0, 512);
-                    log(LogLevel::Info, std::string("[IOP Kprintf] ") + format);
-                    setV0(static_cast<uint32_t>(format.size()));
-                    return ImportDisposition::Handled;
-                }
-                case 15:
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                default:
-                    break;
-                }
-            }
+            if (iequals(call.library, "sysmem") && sysmem.dispatchImport(call.ordinal, cpu))
+                return ImportDisposition::Handled;
 
-            if (iequals(call.library, "cdvdman") &&
-                cdvd.dispatchImport(call.ordinal, cpu))
+            if (iequals(call.library, "cdvdman") && cdvd.dispatchImport(call.ordinal, cpu))
             {
                 if (const auto callback = cdvd.takeCompletionCallback())
                 {
@@ -334,50 +263,8 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             }
 
-            if (iequals(call.library, "loadcore"))
-            {
-                switch (call.ordinal)
-                {
-                case 3:
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 4:
-                case 5:
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 6:
-                case 10:
-                    setV0(imports.registerExportTable(a0) ? 0u : 0xFFFFFFFFu);
-                    return ImportDisposition::Handled;
-                case 7:
-                    setV0(imports.releaseExportTable(a0) ? 0u : 0xFFFFFFFFu);
-                    return ImportDisposition::Handled;
-                case 8:
-                case 9:
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 11:
-                {
-                    const std::string name = readString(a0 + 12u, 8u);
-                    setV0(imports.findTable(name));
-                    return ImportDisposition::Handled;
-                }
-                case 12:
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 13:
-                case 14:
-                case 15:
-                case 16:
-                case 17:
-                case 20:
-                case 21:
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                default:
-                    break;
-                }
-            }
+            if (iequals(call.library, "loadcore") && loadcore.dispatchImport(call.ordinal, cpu))
+                return ImportDisposition::Handled;
 
             if (iequals(call.library, "thbase") || iequals(call.library, "threadman"))
             {
@@ -403,83 +290,8 @@ namespace ps2x::iop::detail
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
             }
-            if (iequals(call.library, "intrman"))
-            {
-                switch (call.ordinal)
-                {
-                case 3:
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 4: // RegisterIntrHandler
-                    interruptHandlers[static_cast<int>(a0)] = {a2, a3, cpu.gpr[28]};
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 5:
-                    interruptHandlers.erase(static_cast<int>(a0));
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 6:
-                    interruptEnabled[static_cast<int>(a0)] = true;
-                    if (a0 < 32u)
-                        memory.setInterruptMask(memory.interruptMask() | (1u << a0));
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 7:
-                    if (a1)
-                        write32(a1, a0);
-                    if (a0 < 32u)
-                        memory.setInterruptMask(memory.interruptMask() & ~(1u << a0));
-                    interruptEnabled[static_cast<int>(a0)] = false;
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 8:
-                    memory.setInterruptControl(0u);
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 9:
-                    memory.setInterruptControl(1u);
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 14:
-                    if (a0)
-                    {
-                        const uint32_t ret = callFunction(a0, a1, a2, a3, cpu.gpr[28], 100000u);
-                        setV0(ret);
-                    }
-                    else
-                        setV0(0);
-                    return ImportDisposition::Handled;
-                case 15:
-                case 16:
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 17:
-                    if (a0)
-                        write32(a0, memory.interruptControl());
-                    memory.setInterruptControl(0u);
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 18:
-                    memory.setInterruptControl(a0 ? 1u : 0u);
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 23:
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 24:
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 25:
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 28:
-                case 30:
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                default:
-                    break;
-                }
-            }
+            if (iequals(call.library, "intrman") && intrman.dispatchImport(call.ordinal, cpu, *this))
+                return ImportDisposition::Handled;
             if (iequals(call.library, "secrman"))
             {
                 switch (call.ordinal)
@@ -498,228 +310,37 @@ namespace ps2x::iop::detail
             }
             if (iequals(call.library, "modload") && call.ordinal == 13u)
             {
-                // SetCheckKelfPathCallback. MODLOAD owns this callback in the
-                // real IOP; retain both the address and the registering
-                // module's GP so a later KELF load can invoke it faithfully.
                 checkKelfPathCallback = {a0, cpu.gpr[28]};
                 setV0(0);
                 return ImportDisposition::Handled;
             }
-            if (iequals(call.library, "ioman"))
-            {
-                switch (call.ordinal)
-                {
-                case 20: // AddDrv
-                {
-                    constexpr size_t kMaxIomanDevices = 16u;
-                    if (a0 == 0u || iomanDevices.size() >= kMaxIomanDevices)
-                    {
-                        setV0(0xFFFFFFFFu);
-                        return ImportDisposition::Handled;
-                    }
-
-                    const uint32_t nameAddress = read32(a0 + 0u);
-                    const uint32_t operations = read32(a0 + 16u);
-                    const std::string name = readString(nameAddress, 64u);
-                    if (nameAddress == 0u || operations == 0u || name.empty())
-                    {
-                        setV0(0xFFFFFFFFu);
-                        return ImportDisposition::Handled;
-                    }
-
-                    // The original IOMAN exposes the device before invoking
-                    // init, then removes it again if initialization fails.
-                    iomanDevices.push_back({a0, cpu.gpr[28], name});
-                    const uint32_t init = read32(operations + 0u);
-                    if (init != 0u)
-                    {
-                        const int32_t initResult = static_cast<int32_t>(
-                            callFunction(init, a0, 0u, 0u, 0u, cpu.gpr[28]));
-                        if (initResult < 0)
-                        {
-                            iomanDevices.pop_back();
-                            setV0(0xFFFFFFFFu);
-                            return ImportDisposition::Handled;
-                        }
-                    }
-
-                    setV0(0u);
-                    return ImportDisposition::Handled;
-                }
-                case 21: // DelDrv
-                {
-                    const std::string name = readString(a0, 64u);
-                    const auto device = std::find_if(
-                        iomanDevices.begin(), iomanDevices.end(),
-                        [&](const IomanDevice &candidate)
-                        { return candidate.name == name; });
-                    if (device == iomanDevices.end())
-                    {
-                        setV0(0xFFFFFFFFu);
-                        return ImportDisposition::Handled;
-                    }
-
-                    const uint32_t operations = read32(device->address + 16u);
-                    const uint32_t deinit = operations != 0u ? read32(operations + 4u) : 0u;
-                    if (deinit != 0u)
-                        (void)callFunction(deinit, device->address, 0u, 0u, 0u, device->gp);
-                    iomanDevices.erase(device);
-                    setV0(0u);
-                    return ImportDisposition::Handled;
-                }
-                default:
-                    break;
-                }
-            }
+            if (iequals(call.library, "ioman") && ioman.dispatchImport(call.ordinal, cpu, *this))
+                return ImportDisposition::Handled;
             if (iequals(call.library, "sifman"))
             {
                 return rpc.dispatchSifManImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
             }
-            if (iequals(call.library, "vblank"))
-            {
-                switch (call.ordinal)
-                {
-                case 4: // WaitVblankStart
-                case 5: // WaitVblankEnd
-                case 6: // WaitVblank
-                case 7: // WaitNonVblank
-                {
-                    const bool waitForEnd = call.ordinal == 5u || call.ordinal == 7u;
-                    const uint64_t phase = waitForEnd ? kVblankEndPhaseCycles : 0u;
-                    const uint64_t fieldStart = totalCycles - (totalCycles % kVblankPeriodCycles);
-                    uint64_t wakeCycle = fieldStart + phase;
-                    if (wakeCycle <= totalCycles)
-                        wakeCycle += kVblankPeriodCycles;
-                    kernel.delayCurrentUntil(wakeCycle, cpu);
-                }
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 8: // RegisterVblankHandler
-                case 9: // ReleaseVblankHandler
-                    // Callback delivery is not required by the scheduler wait
-                    // ABI yet.
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                default:
-                    break;
-                }
-            }
-            if (iequals(call.library, "timrman") || iequals(call.library, "dmacman"))
+            if (iequals(call.library, "vblank") && vblank.dispatchImport(call.ordinal, cpu, totalCycles))
+                return ImportDisposition::Handled;
+            if (iequals(call.library, "timrman") && timrman.dispatchImport(call.ordinal, cpu, totalCycles))
+                return ImportDisposition::Handled;
+            if (iequals(call.library, "dmacman"))
             {
                 setV0(0);
                 return ImportDisposition::Handled;
             }
-            if (iequals(call.library, "stdio"))
-            {
-                switch (call.ordinal)
-                {
-                case 4: // printf
-                {
-                    const std::string text = readString(a0, 2048);
-                    log(LogLevel::Info, std::string("[IOP printf] ") + text);
-                    setV0(static_cast<uint32_t>(text.size()));
-                    return ImportDisposition::Handled;
-                }
-                case 5:
-                    setV0(0xFFFFFFFFu);
-                    return ImportDisposition::Handled; // getchar
-                case 6:
-                {
-                    const char ch = static_cast<char>(a0 & 0xFFu);
-                    log(LogLevel::Info, std::string("[IOP putchar] ") + ch);
-                    setV0(a0 & 0xFFu);
-                    return ImportDisposition::Handled;
-                }
-                case 7:
-                {
-                    const std::string text = readString(a0, 2048);
-                    log(LogLevel::Info, std::string("[IOP puts] ") + text);
-                    setV0(static_cast<uint32_t>(text.size() + 1u));
-                    return ImportDisposition::Handled;
-                }
-                case 8:
-                    setV0(0);
-                    return ImportDisposition::Handled; // gets
-                case 9:
-                {
-                    const std::string text = readString(a1, 2048);
-                    log(LogLevel::Info, std::string("[IOP fdprintf] ") + text);
-                    setV0(static_cast<uint32_t>(text.size()));
-                    return ImportDisposition::Handled;
-                }
-                case 10:
-                    setV0(0xFFFFFFFFu);
-                    return ImportDisposition::Handled;
-                case 11:
-                    setV0(a0 & 0xFFu);
-                    return ImportDisposition::Handled;
-                case 12:
-                {
-                    const std::string text = readString(a0, 2048);
-                    log(LogLevel::Info, std::string("[IOP fdputs] ") + text);
-                    setV0(static_cast<uint32_t>(text.size()));
-                    return ImportDisposition::Handled;
-                }
-                case 13:
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 14:
-                {
-                    const std::string text = readString(a1, 2048);
-                    log(LogLevel::Info, std::string("[IOP vfdprintf] ") + text);
-                    setV0(static_cast<uint32_t>(text.size()));
-                    return ImportDisposition::Handled;
-                }
-                default:
-                    break;
-                }
-            }
+            if (iequals(call.library, "stdio") && stdio.dispatchImport(call.ordinal, cpu))
+                return ImportDisposition::Handled;
             if (iequals(call.library, "sysclib"))
             {
                 return sysclib.dispatchImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
             }
-            if (iequals(call.library, "heaplib"))
-            {
-                switch (call.ordinal)
-                {
-                case 4: // CreateHeap - heap identity is opaque to callers.
-                    setV0(allocate(16u, 16u));
-                    return ImportDisposition::Handled;
-                case 5: // DeleteHeap
-                    if (a0)
-                        freeAllocation(a0);
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 6:
-                    setV0(allocate(a1, 16u));
-                    return ImportDisposition::Handled;
-                case 7:
-                    setV0(freeAllocation(a1) ? 0u : 0xFFFFFFFFu);
-                    return ImportDisposition::Handled;
-                case 8:
-                    setV0(maxFreeMemory());
-                    return ImportDisposition::Handled;
-                case 11:
-                    setV0(0);
-                    return ImportDisposition::Handled;
-                case 15:
-                {
-                    if (const auto block = memory.allocationContaining(a0))
-                    {
-                        setV0(block->size);
-                        return ImportDisposition::Handled;
-                    }
-                    setV0(0xFFFFFFFFu);
-                    return ImportDisposition::Handled;
-                }
-                default:
-                    break;
-                }
-            }
+            if (iequals(call.library, "heaplib") && heaplib.dispatchImport(call.ordinal, cpu))
+                return ImportDisposition::Handled;
 
             const uint32_t target = imports.resolve(call.library, call.ordinal);
             if (target != 0u)
@@ -847,6 +468,17 @@ namespace ps2x::iop::detail
             return callFunction(address, a0, a1, a2, a3, gp);
         }
 
+        uint32_t executeGuestFunctionWithBudget(uint32_t address,
+                                                uint32_t a0,
+                                                uint32_t a1,
+                                                uint32_t a2,
+                                                uint32_t a3,
+                                                uint32_t gp,
+                                                uint32_t instructionBudget) override
+        {
+            return callFunction(address, a0, a1, a2, a3, gp, instructionBudget);
+        }
+
         // Not that good to use exception handling for control flow but will do for now
         void servicePendingDmaInterrupts()
         {
@@ -869,22 +501,7 @@ namespace ps2x::iop::detail
             try
             {
                 for (const int irq : completed)
-                {
-                    const auto enabled = interruptEnabled.find(irq);
-                    if (enabled == interruptEnabled.end() || !enabled->second)
-                        continue;
-                    const auto handler = interruptHandlers.find(irq);
-                    if (handler == interruptHandlers.end() || handler->second.function == 0u)
-                        continue;
-
-                    (void)callFunction(handler->second.function,
-                                       handler->second.argument,
-                                       0u,
-                                       0u,
-                                       0u,
-                                       handler->second.gp,
-                                       100000u);
-                }
+                    (void)intrman.dispatchInterrupt(irq, *this);
             }
             catch (...)
             {
@@ -944,6 +561,7 @@ namespace ps2x::iop::detail
                 {
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
+                    timrman.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
                     {
@@ -952,6 +570,7 @@ namespace ps2x::iop::detail
                             nextWake = std::min(nextWake, completionCycle);
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                        nextWake = timrman.nextEventCycle(nextWake);
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                         continue;
                     }
@@ -1060,16 +679,21 @@ namespace ps2x::iop::detail
 
         IopHost &host;
         IopMemory memory;
-        IopCdvd cdvd;
+        IopSysmem sysmem;
         IopKernel kernel;
+        IopCdvd cdvd;
+        IopVblank vblank;
         IopRpcBridge rpc;
         IopSysclib sysclib;
+        IopStdio stdio;
+        IopHeaplib heaplib;
+        IopIntrman intrman;
+        IopTimrman timrman;
+        IopIoman ioman;
         IopCpuCore cpuCore;
         IopImportRegistry imports;
+        IopLoadcore loadcore;
         std::map<int, Module> modules;
-        std::unordered_map<int, InterruptHandler> interruptHandlers;
-        std::vector<IomanDevice> iomanDevices;
-        std::map<int, bool> interruptEnabled;
         std::map<int, uint64_t> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
         uint32_t nextModuleId = 1;
@@ -1136,6 +760,45 @@ namespace ps2x::iop::detail
     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
     {
         m_impl->rpc.onSifTransfer(transfer);
+    }
+
+    uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)
+    {
+        return m_impl->memory.allocate(size, alignment);
+    }
+
+    bool IopEmulator::freeMemory(uint32_t address)
+    {
+        return m_impl->memory.freeAllocation(address);
+    }
+
+    bool IopEmulator::readMemory(uint32_t address, void *destination, size_t size) const
+    {
+        return isMemoryRange(address, size) &&
+               m_impl->memory.readRam(address, destination, size);
+    }
+
+    bool IopEmulator::writeMemory(uint32_t address, const void *source, size_t size)
+    {
+        return isMemoryRange(address, size) &&
+               m_impl->memory.writeRam(address, source, size);
+    }
+
+    bool IopEmulator::zeroMemory(uint32_t address, size_t size)
+    {
+        return isMemoryRange(address, size) &&
+               m_impl->memory.zeroRam(address, size);
+    }
+
+    bool IopEmulator::isMemoryRange(uint32_t address, size_t size) const
+    {
+        const bool physicalSegment = address < IopMemory::RamSize;
+        const bool cachedSegment = address >= 0x80000000u && address < 0x80200000u;
+        const bool uncachedSegment = address >= 0xA0000000u && address < 0xA0200000u;
+        if (!physicalSegment && !cachedSegment && !uncachedSegment)
+            return false;
+        const uint32_t physical = IopMemory::physicalAddress(address);
+        return physical <= IopMemory::RamSize && size <= IopMemory::RamSize - physical;
     }
 
     uint64_t IopEmulator::cycles() const noexcept

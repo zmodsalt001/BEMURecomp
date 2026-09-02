@@ -1,7 +1,7 @@
 #include "iop_sysclib.h"
 
-#include "iop_cpu.h"
-#include "iop_memory.h"
+#include "../core/iop_cpu.h"
+#include "../core/iop_memory.h"
 
 #include <cctype>
 #include <cstdlib>
@@ -64,7 +64,7 @@ namespace ps2x::iop::detail
         case 4: // setjmp - enough for callers which only test the initial return.
             setV0(0);
             return true;
-        case 5: // longjmp cannot be safely synthesized without the BIOS jmp_buf ABI.
+        case 5: // longjmp, TODO bc w can do it without the BIOS jmp_buf ABI.
             setV0(a1 == 0u ? 1u : a1);
             return true;
         case 6:

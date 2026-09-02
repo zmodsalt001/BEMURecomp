@@ -1,7 +1,7 @@
 #include "iop_kernel.h"
 
 #include "iop_memory.h"
-#include "iop_emulator_const.h"
+#include "../iop_emulator_const.h"
 
 #include <algorithm>
 
@@ -502,6 +502,28 @@ namespace ps2x::iop::detail
         }
     }
 
+    int IopKernel::createInternalEventFlag(uint32_t attr, uint32_t option, uint32_t bits)
+    {
+        EventFlag event;
+        event.id = static_cast<int>(m_nextEventFlagId++);
+        event.attr = attr;
+        event.option = option;
+        event.bits = bits;
+        const int id = event.id;
+        m_eventFlags.emplace(id, event);
+        return id;
+    }
+
+    bool IopKernel::setInternalEventFlag(int id, uint32_t bits)
+    {
+        const auto event = m_eventFlags.find(id);
+        if (event == m_eventFlags.end())
+            return false;
+        event->second.bits |= bits;
+        wakeEventWaiters(event->second);
+        return true;
+    }
+
     bool IopKernel::dispatchEventImport(uint16_t ordinal, IopCpuState &cpu)
     {
         const auto setV0 = [&](int32_t value)
@@ -514,13 +536,9 @@ namespace ps2x::iop::detail
         case 4:
         {
             const uint32_t descriptor = cpu.gpr[4];
-            EventFlag event;
-            event.id = static_cast<int>(m_nextEventFlagId++);
-            event.attr = m_memory.read32(descriptor + 0u);
-            event.option = m_memory.read32(descriptor + 4u);
-            event.bits = m_memory.read32(descriptor + 8u);
-            m_eventFlags.emplace(event.id, event);
-            setV0(event.id);
+            setV0(createInternalEventFlag(m_memory.read32(descriptor + 0u),
+                                          m_memory.read32(descriptor + 4u),
+                                          m_memory.read32(descriptor + 8u)));
             return true;
         }
         case 5:
@@ -546,14 +564,11 @@ namespace ps2x::iop::detail
         case 6:
         case 7:
         {
-            const auto event = m_eventFlags.find(static_cast<int>(cpu.gpr[4]));
-            if (event == m_eventFlags.end())
+            if (!setInternalEventFlag(static_cast<int>(cpu.gpr[4]), cpu.gpr[5]))
             {
                 setV0(-1);
                 return true;
             }
-            event->second.bits |= cpu.gpr[5];
-            wakeEventWaiters(event->second);
             setV0(0);
             return true;
         }

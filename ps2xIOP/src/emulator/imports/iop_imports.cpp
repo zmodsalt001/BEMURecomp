@@ -1,6 +1,6 @@
 #include "iop_imports.h"
 
-#include "iop_memory.h"
+#include "../core/iop_memory.h"
 
 #include <algorithm>
 #include <cctype>
@@ -145,6 +145,26 @@ namespace ps2x::iop::detail
         if (found == m_libraries.end() || ordinal >= found->second.functions.size())
             return 0u;
         return found->second.functions[ordinal];
+    }
+
+    int32_t IopImportRegistry::setRebootTimeLibraryHandlingMode(uint32_t address, uint32_t mode)
+    {
+        constexpr int32_t kLibraryNotFound = -213;
+        constexpr int32_t kIllegalLibrary = -214;
+
+        if (address == 0u)
+            return kIllegalLibrary;
+        const uint32_t physical = IopMemory::physicalAddress(address);
+        if (physical + 12u > IopMemory::RamSize)
+            return kLibraryNotFound;
+
+        const bool registered = m_libraries.find(physical) != m_libraries.end();
+        if (!registered && m_memory.read32(physical) != kExportMagic)
+            return kLibraryNotFound;
+
+        const uint16_t oldMode = m_memory.read16(physical + 10u);
+        m_memory.write16(physical + 10u, static_cast<uint16_t>((oldMode & ~6u) | (mode & 6u)));
+        return 0;
     }
 
     void IopImportRegistry::eraseRange(uint32_t base, uint32_t size)

@@ -82,43 +82,75 @@ namespace ps2x::iop::detail
             flavor = Flavor::NewXmcserv;
             switch (function)
             {
-            case 0xFEu: return Operation::Init;
-            case 0x01u: return Operation::GetInfo;
-            case 0x02u: return Operation::Open;
-            case 0x03u: return Operation::Close;
-            case 0x04u: return Operation::Seek;
-            case 0x05u: return Operation::Read;
-            case 0x06u: return Operation::Write;
-            case 0x0Au: return Operation::Flush;
-            case 0x0Cu: return Operation::Chdir;
-            case 0x0Du: return Operation::GetDir;
-            case 0x0Eu: return Operation::SetInfo;
-            case 0x0Fu: return Operation::Delete;
-            case 0x10u: return Operation::Format;
-            case 0x11u: return Operation::Unformat;
-            case 0x12u: return Operation::GetEnt;
-            case 0x14u: return Operation::ChangePriority;
-            default: break;
+            case 0xFEu:
+                return Operation::Init;
+            case 0x01u:
+                return Operation::GetInfo;
+            case 0x02u:
+                return Operation::Open;
+            case 0x03u:
+                return Operation::Close;
+            case 0x04u:
+                return Operation::Seek;
+            case 0x05u:
+                return Operation::Read;
+            case 0x06u:
+                return Operation::Write;
+            case 0x0Au:
+                return Operation::Flush;
+            case 0x0Cu:
+                return Operation::Chdir;
+            case 0x0Du:
+                return Operation::GetDir;
+            case 0x0Eu:
+                return Operation::SetInfo;
+            case 0x0Fu:
+                return Operation::Delete;
+            case 0x10u:
+                return Operation::Format;
+            case 0x11u:
+                return Operation::Unformat;
+            case 0x12u:
+                return Operation::GetEnt;
+            case 0x14u:
+                return Operation::ChangePriority;
+            default:
+                break;
             }
 
             flavor = Flavor::OldMcserv;
             switch (function)
             {
-            case 0x70u: return Operation::Init;
-            case 0x71u: return Operation::Open;
-            case 0x72u: return Operation::Close;
-            case 0x73u: return Operation::Read;
-            case 0x74u: return Operation::Write;
-            case 0x75u: return Operation::Seek;
-            case 0x76u: return Operation::GetDir;
-            case 0x77u: return Operation::Format;
-            case 0x78u: return Operation::GetInfo;
-            case 0x79u: return Operation::Delete;
-            case 0x7Au: return Operation::Flush;
-            case 0x7Bu: return Operation::Chdir;
-            case 0x7Cu: return Operation::SetInfo;
-            case 0x80u: return Operation::Unformat;
-            default: return Operation::Unknown;
+            case 0x70u:
+                return Operation::Init;
+            case 0x71u:
+                return Operation::Open;
+            case 0x72u:
+                return Operation::Close;
+            case 0x73u:
+                return Operation::Read;
+            case 0x74u:
+                return Operation::Write;
+            case 0x75u:
+                return Operation::Seek;
+            case 0x76u:
+                return Operation::GetDir;
+            case 0x77u:
+                return Operation::Format;
+            case 0x78u:
+                return Operation::GetInfo;
+            case 0x79u:
+                return Operation::Delete;
+            case 0x7Au:
+                return Operation::Flush;
+            case 0x7Bu:
+                return Operation::Chdir;
+            case 0x7Cu:
+                return Operation::SetInfo;
+            case 0x80u:
+                return Operation::Unformat;
+            default:
+                return Operation::Unknown;
             }
         }
 
@@ -136,6 +168,7 @@ namespace ps2x::iop::detail
 
             [[nodiscard]] std::string_view name() const override { return "MCSERV"; }
             [[nodiscard]] std::span<const uint32_t> sids() const override { return m_sids; }
+            [[nodiscard]] std::span<const std::string_view> moduleAliases() const override { return m_moduleAliases; }
 
             void reset() override
             {
@@ -245,8 +278,7 @@ namespace ps2x::iop::detail
                 (void)m_host.writeGuest(receive.address, &result, sizeof(result));
                 if (receive.size > sizeof(result))
                 {
-                    (void)m_host.zeroGuest(receive.address + sizeof(result),
-                                           receive.size - sizeof(result));
+                    (void)m_host.zeroGuest(receive.address + sizeof(result), receive.size - sizeof(result));
                 }
             }
 
@@ -270,8 +302,7 @@ namespace ps2x::iop::detail
                                         uint32_t sendAddress,
                                         const NameParameter &parameter)
             {
-                const uint32_t nameAddress =
-                    sendAddress + static_cast<uint32_t>(offsetof(NameParameter, name));
+                const uint32_t nameAddress = sendAddress + static_cast<uint32_t>(offsetof(NameParameter, name));
                 const uint32_t port = static_cast<uint32_t>(parameter.port);
                 const uint32_t slot = static_cast<uint32_t>(parameter.slot);
                 switch (operation)
@@ -281,12 +312,9 @@ namespace ps2x::iop::detail
                     {
                         return call(MemoryCardOperation::Mkdir, port, slot, nameAddress);
                     }
-                    return call(MemoryCardOperation::Open,
-                                port, slot, nameAddress,
-                                static_cast<uint32_t>(parameter.flags));
+                    return call(MemoryCardOperation::Open, port, slot, nameAddress, static_cast<uint32_t>(parameter.flags));
                 case Operation::Chdir:
-                    return call(MemoryCardOperation::Chdir,
-                                port, slot, nameAddress, parameter.pointer);
+                    return call(MemoryCardOperation::Chdir, port, slot, nameAddress, parameter.pointer);
                 case Operation::SetInfo:
                     return call(MemoryCardOperation::SetFileInfo, port, slot, nameAddress);
                 case Operation::Delete:
@@ -302,9 +330,7 @@ namespace ps2x::iop::detail
                 }
             }
 
-            int32_t handleDescriptorOperation(Operation operation,
-                                               Flavor flavor,
-                                               const DescriptorParameter &parameter)
+            int32_t handleDescriptorOperation(Operation operation, Flavor flavor, const DescriptorParameter &parameter)
             {
                 switch (operation)
                 {
@@ -392,6 +418,7 @@ namespace ps2x::iop::detail
             mutable std::mutex m_mutex;
             uint32_t m_unknownRpcLogCount = 0u;
             const std::array<uint32_t, 2> m_sids = {kMcservSid, kMcservDev9Sid};
+            const std::array<std::string_view, 2> m_moduleAliases = {"mcserv", "xmcserv"};
         };
     }
 

@@ -187,7 +187,7 @@ namespace ps2x::iop::detail
                 uint32_t normalizedSource = 0u;
                 uint32_t normalizedDestination = 0u;
                 if (!m_host.normalizeGuestAddress(transfer.sourceAddress, normalizedSource) ||
-                    !m_host.normalizeGuestAddress(transfer.destinationAddress, normalizedDestination))
+                    !m_host.normalizeIopAddress(transfer.destinationAddress, normalizedDestination))
                 {
                     return;
                 }
@@ -333,6 +333,13 @@ namespace ps2x::iop::detail
                 return normalized;
             }
 
+            uint32_t normalizeIopAddress(uint32_t address) const
+            {
+                uint32_t normalized = 0u;
+                (void)m_host.normalizeIopAddress(address, normalized);
+                return normalized;
+            }
+
             RpcResult handleCreateTransport(const RpcRequest &request, RpcResult result)
             {
                 uint32_t dtxId = 0u;
@@ -351,7 +358,7 @@ namespace ps2x::iop::detail
                 }
 
                 const uint32_t normalizedEeWorkAddress = normalizeAddress(eeWorkAddress);
-                const uint32_t normalizedIopWorkAddress = normalizeAddress(iopWorkAddress);
+                const uint32_t normalizedIopWorkAddress = normalizeIopAddress(iopWorkAddress);
 
                 uint32_t remoteHandle = 0u;
                 {

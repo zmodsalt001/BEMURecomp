@@ -54,6 +54,9 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool dispatchSemaphoreImport(uint16_t ordinal, IopCpuState &cpu);
         [[nodiscard]] bool dispatchEventImport(uint16_t ordinal, IopCpuState &cpu);
 
+        [[nodiscard]] int createInternalEventFlag(uint32_t attr, uint32_t option, uint32_t bits);
+        [[nodiscard]] bool setInternalEventFlag(int id, uint32_t bits);
+
         void sleepCurrent(IopCpuState &cpu);
         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
 

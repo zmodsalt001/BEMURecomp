@@ -33,6 +33,11 @@ namespace ps2x::iop::detail
                 return kSids;
             }
 
+            [[nodiscard]] std::span<const std::string_view> moduleAliases() const override
+            {
+                return kModuleAliases;
+            }
+
             void reset() override
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
@@ -99,6 +104,7 @@ namespace ps2x::iop::detail
 
         private:
             inline static constexpr std::array<uint32_t, 1> kSids{kDbcManSid};
+            inline static constexpr std::array<std::string_view, 3> kModuleAliases{"dbcman", "dbcm", "dbcmserv"};
 
             IopHost &m_host;
             mutable std::mutex m_mutex;

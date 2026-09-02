@@ -139,6 +139,7 @@ namespace ps2x::iop
         std::string name;
         std::vector<uint32_t> sids;
         bool profileSpecific = false;
+        bool active = true;
         std::vector<DebugMetric> metrics;
     };
 
